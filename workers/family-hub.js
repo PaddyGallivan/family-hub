@@ -1,1388 +1,2320 @@
-// family-hub Worker v1.0.0
-// Single-file: REST API + embedded SPA
-// Bindings needed: DB (D1 family-hub), PHOTOS (R2 family-hub-photos)
+// Family Hub v2 — single-file Cloudflare Worker
+// Built: 2026-05-01
 
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-};
+// Family Hub v2 - Part 1: Auth, Crypto, Core API helpers
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
-  });
-}
-
-function htmlResp(content) {
-  return new Response(content, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
-  });
-}
-
+// ─── CRYPTO UTILS ────────────────────────────────────────────────────────────
 async function hashPassword(password, salt) {
   const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey('raw', enc.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: enc.encode(salt), iterations: 10000, hash: 'SHA-256' },
-    key, 256
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), {name:'PBKDF2'}, false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({name:'PBKDF2', salt:enc.encode(salt), iterations:10000, hash:'SHA-256'}, key, 256);
+  return Array.from(new Uint8Array(bits)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+async function getChatKey(chatId, secret) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(secret), {name:'HKDF'}, false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name:'HKDF', hash:'SHA-256', salt:enc.encode('family-hub-chat-v2'), info:enc.encode(String(chatId))},
+    keyMaterial, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']
   );
-  return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function generateToken(len = 24) {
-  return Array.from(crypto.getRandomValues(new Uint8Array(len)))
-    .map(b => b.toString(16).padStart(2, '0')).join('');
+async function encryptMsg(content, chatId, secret) {
+  const key = await getChatKey(chatId, secret);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, new TextEncoder().encode(content));
+  const out = new Uint8Array(12 + ct.byteLength);
+  out.set(iv); out.set(new Uint8Array(ct), 12);
+  return btoa(String.fromCharCode(...out));
 }
 
-async function getUser(env, sessionToken) {
-  if (!sessionToken) return null;
+async function decryptMsg(encoded, chatId, secret) {
   try {
-    return await env.DB.prepare(
-      `SELECT u.* FROM sessions s JOIN users u ON s.user_id = u.id
-       WHERE s.id = ? AND (s.expires_at IS NULL OR s.expires_at > CURRENT_TIMESTAMP)`
-    ).bind(sessionToken).first();
+    const key = await getChatKey(chatId, secret);
+    const buf = Uint8Array.from(atob(encoded), c=>c.charCodeAt(0));
+    const iv = buf.slice(0,12);
+    const ct = buf.slice(12);
+    const plain = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, ct);
+    return new TextDecoder().decode(plain);
+  } catch { return '[encrypted]'; }
+}
+
+async function encryptDoc(content, docId, secret) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(secret), {name:'HKDF'}, false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey(
+    {name:'HKDF', hash:'SHA-256', salt:enc.encode('family-hub-docs-v2'), info:enc.encode(String(docId))},
+    keyMaterial, {name:'AES-GCM', length:256}, false, ['encrypt']
+  );
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = typeof content === 'string' ? enc.encode(content) : content;
+  const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, data);
+  const out = new Uint8Array(12 + ct.byteLength);
+  out.set(iv); out.set(new Uint8Array(ct), 12);
+  return out;
+}
+
+async function decryptDoc(buf, docId, secret) {
+  try {
+    const enc = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(secret), {name:'HKDF'}, false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey(
+      {name:'HKDF', hash:'SHA-256', salt:enc.encode('family-hub-docs-v2'), info:enc.encode(String(docId))},
+      keyMaterial, {name:'AES-GCM', length:256}, false, ['decrypt']
+    );
+    const iv = buf.slice(0,12);
+    const ct = buf.slice(12);
+    return await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, ct);
   } catch { return null; }
 }
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: CORS_HEADERS });
-    }
-
-    // Serve SPA for all non-API routes
-    if (!path.startsWith('/api/')) {
-      return htmlResp(getSPA());
-    }
-
-    // Auth: get session user
-    const authHeader = request.headers.get('Authorization');
-    const sessionToken = authHeader?.replace('Bearer ', '') || null;
-    const user = await getUser(env, sessionToken);
-
-    try {
-      // ── AUTH (no token required) ──────────────────────────────────
-      if (path === '/api/auth/redeem' && request.method === 'POST') {
-        const { token, name, password } = await request.json();
-        const existing = await env.DB.prepare(
-          'SELECT * FROM users WHERE invite_token = ?'
-        ).bind(token).first();
-        if (!existing) return json({ error: 'Invalid invite link' }, 401);
-        if (existing.password_hash) return json({ error: 'Already activated — please log in' }, 400);
-        const salt = generateToken(16);
-        const hash = await hashPassword(password, salt);
-        const displayName = (name || existing.name).trim();
-        await env.DB.prepare(
-          'UPDATE users SET name = ?, password_hash = ?, invite_token = NULL WHERE id = ?'
-        ).bind(displayName, `${salt}:${hash}`, existing.id).run();
-        const sessionId = generateToken();
-        await env.DB.prepare('INSERT INTO sessions (id, user_id) VALUES (?, ?)').bind(sessionId, existing.id).run();
-        const updatedUser = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(existing.id).first();
-        return json({ token: sessionId, user: sanitizeUser(updatedUser) });
-      }
-
-      if (path === '/api/auth/login' && request.method === 'POST') {
-        const { name, password } = await request.json();
-        const existing = await env.DB.prepare(
-          'SELECT * FROM users WHERE LOWER(name) = LOWER(?)'
-        ).bind(name.trim()).first();
-        if (!existing || !existing.password_hash) return json({ error: 'Invalid name or password' }, 401);
-        const [salt, hash] = existing.password_hash.split(':');
-        const attempt = await hashPassword(password, salt);
-        if (attempt !== hash) return json({ error: 'Invalid name or password' }, 401);
-        const sessionId = generateToken();
-        await env.DB.prepare('INSERT INTO sessions (id, user_id) VALUES (?, ?)').bind(sessionId, existing.id).run();
-        return json({ token: sessionId, user: sanitizeUser(existing) });
-      }
-
-      if (path === '/api/auth/me' && request.method === 'GET') {
-        if (!user) return json({ error: 'Unauthorized' }, 401);
-        return json({ user: sanitizeUser(user) });
-      }
-
-      // ── ALL ROUTES BELOW REQUIRE AUTH ────────────────────────────
-      if (!user) return json({ error: 'Unauthorized' }, 401);
-
-      // ── USERS ─────────────────────────────────────────────────────
-      if (path === '/api/users' && request.method === 'GET') {
-        const users = await env.DB.prepare(
-          'SELECT id, name, relationship, avatar_url, birthday FROM users ORDER BY name ASC'
-        ).all();
-        return json(users.results);
-      }
-
-      if (path === '/api/users/me' && request.method === 'PUT') {
-        const { name, avatar_url, birthday } = await request.json();
-        await env.DB.prepare(
-          'UPDATE users SET name = COALESCE(?, name), avatar_url = COALESCE(?, avatar_url), birthday = COALESCE(?, birthday) WHERE id = ?'
-        ).bind(name || null, avatar_url || null, birthday || null, user.id).run();
-        const updated = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first();
-        return json({ user: sanitizeUser(updated) });
-      }
-
-      // ── FEED / POSTS ──────────────────────────────────────────────
-      if (path === '/api/posts' && request.method === 'GET') {
-        const posts = await env.DB.prepare(`
-          SELECT p.*, u.name as author_name, u.avatar_url as author_avatar,
-            (SELECT COUNT(*) FROM post_likes WHERE post_id = p.id) as likes_count,
-            (SELECT COUNT(*) FROM post_comments WHERE post_id = p.id) as comments_count,
-            (SELECT COUNT(*) FROM post_likes WHERE post_id = p.id AND user_id = ?) as liked_by_me
-          FROM posts p JOIN users u ON p.user_id = u.id
-          ORDER BY p.created_at DESC LIMIT 50
-        `).bind(user.id).all();
-        return json(posts.results);
-      }
-
-      if (path === '/api/posts' && request.method === 'POST') {
-        const { content, media_urls, post_type } = await request.json();
-        const result = await env.DB.prepare(
-          'INSERT INTO posts (user_id, content, media_urls, post_type) VALUES (?, ?, ?, ?) RETURNING *'
-        ).bind(user.id, content || '', JSON.stringify(media_urls || []), post_type || 'post').first();
-        return json({ ...result, author_name: user.name, author_avatar: user.avatar_url, likes_count: 0, comments_count: 0, liked_by_me: 0 });
-      }
-
-      const likeMatch = path.match(/^\/api\/posts\/(\d+)\/like$/);
-      if (likeMatch && request.method === 'POST') {
-        const postId = likeMatch[1];
-        const ex = await env.DB.prepare('SELECT id FROM post_likes WHERE post_id = ? AND user_id = ?').bind(postId, user.id).first();
-        if (ex) {
-          await env.DB.prepare('DELETE FROM post_likes WHERE post_id = ? AND user_id = ?').bind(postId, user.id).run();
-          return json({ liked: false });
-        }
-        await env.DB.prepare('INSERT INTO post_likes (post_id, user_id) VALUES (?, ?)').bind(postId, user.id).run();
-        return json({ liked: true });
-      }
-
-      const commentsMatch = path.match(/^\/api\/posts\/(\d+)\/comments$/);
-      if (commentsMatch) {
-        const postId = commentsMatch[1];
-        if (request.method === 'GET') {
-          const comments = await env.DB.prepare(
-            'SELECT c.*, u.name as author_name FROM post_comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC'
-          ).bind(postId).all();
-          return json(comments.results);
-        }
-        if (request.method === 'POST') {
-          const { content } = await request.json();
-          const result = await env.DB.prepare(
-            'INSERT INTO post_comments (post_id, user_id, content) VALUES (?, ?, ?) RETURNING *'
-          ).bind(postId, user.id, content).first();
-          return json({ ...result, author_name: user.name });
-        }
-      }
-
-      // ── CHATS ─────────────────────────────────────────────────────
-      if (path === '/api/chats' && request.method === 'GET') {
-        const chats = await env.DB.prepare(`
-          SELECT c.*,
-            (SELECT m.content FROM messages m WHERE m.chat_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_message,
-            (SELECT u2.name FROM messages m2 JOIN users u2 ON m2.user_id = u2.id WHERE m2.chat_id = c.id ORDER BY m2.created_at DESC LIMIT 1) as last_author,
-            (SELECT m3.created_at FROM messages m3 WHERE m3.chat_id = c.id ORDER BY m3.created_at DESC LIMIT 1) as last_at
-          FROM chats c
-          JOIN chat_members cm ON c.id = cm.chat_id
-          WHERE cm.user_id = ?
-          ORDER BY last_at DESC
-        `).bind(user.id).all();
-        return json(chats.results);
-      }
-
-      if (path === '/api/chats' && request.method === 'POST') {
-        const { name, chat_type, member_ids } = await request.json();
-        const chat = await env.DB.prepare(
-          'INSERT INTO chats (name, chat_type, created_by) VALUES (?, ?, ?) RETURNING *'
-        ).bind(name, chat_type || 'group', user.id).first();
-        const members = [...new Set([user.id, ...(member_ids || [])])];
-        for (const mid of members) {
-          await env.DB.prepare('INSERT OR IGNORE INTO chat_members (chat_id, user_id) VALUES (?, ?)').bind(chat.id, mid).run();
-        }
-        return json(chat);
-      }
-
-      const chatMsgMatch = path.match(/^\/api\/chats\/(\d+)\/messages$/);
-      if (chatMsgMatch) {
-        const chatId = chatMsgMatch[1];
-        const isMember = await env.DB.prepare('SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?').bind(chatId, user.id).first();
-        if (!isMember) return json({ error: 'Not a member of this chat' }, 403);
-        if (request.method === 'GET') {
-          const msgs = await env.DB.prepare(
-            'SELECT m.*, u.name as author_name FROM messages m JOIN users u ON m.user_id = u.id WHERE m.chat_id = ? ORDER BY m.created_at ASC LIMIT 200'
-          ).bind(chatId).all();
-          return json(msgs.results);
-        }
-        if (request.method === 'POST') {
-          const { content } = await request.json();
-          const result = await env.DB.prepare(
-            'INSERT INTO messages (chat_id, user_id, content) VALUES (?, ?, ?) RETURNING *'
-          ).bind(chatId, user.id, content).first();
-          return json({ ...result, author_name: user.name });
-        }
-      }
-
-      // ── BIRTHDAYS ─────────────────────────────────────────────────
-      if (path === '/api/birthdays' && request.method === 'GET') {
-        const bdays = await env.DB.prepare(
-          `SELECT id, name, relationship, birthday FROM users WHERE birthday IS NOT NULL ORDER BY strftime('%m-%d', birthday) ASC`
-        ).all();
-        return json(bdays.results);
-      }
-
-      // ── GIFT LISTS ────────────────────────────────────────────────
-      if (path === '/api/gifts' && request.method === 'GET') {
-        const userId = url.searchParams.get('user_id') || user.id;
-        const gifts = await env.DB.prepare(`
-          SELECT g.*, u.name as claimed_by_name
-          FROM gift_lists g
-          LEFT JOIN users u ON g.claimed_by = u.id
-          WHERE g.user_id = ?
-          ORDER BY g.event_type, g.created_at DESC
-        `).bind(userId).all();
-        // Hide who claimed if it's the user's own list (so no spoilers)
-        const results = gifts.results.map(g => {
-          if (parseInt(userId) === user.id && g.claimed_by) {
-            return { ...g, claimed_by: 'someone', claimed_by_name: 'Someone ✓' };
-          }
-          return g;
-        });
-        return json(results);
-      }
-
-      if (path === '/api/gifts' && request.method === 'POST') {
-        const { title, description, url: gUrl, price, event_type } = await request.json();
-        const result = await env.DB.prepare(
-          'INSERT INTO gift_lists (user_id, title, description, url, price, event_type) VALUES (?, ?, ?, ?, ?, ?) RETURNING *'
-        ).bind(user.id, title, description || null, gUrl || null, price || null, event_type || 'birthday').first();
-        return json(result);
-      }
-
-      const claimMatch = path.match(/^\/api\/gifts\/(\d+)\/claim$/);
-      if (claimMatch && request.method === 'POST') {
-        const giftId = claimMatch[1];
-        const gift = await env.DB.prepare('SELECT * FROM gift_lists WHERE id = ?').bind(giftId).first();
-        if (!gift) return json({ error: 'Not found' }, 404);
-        if (gift.user_id === user.id) return json({ error: "Can't claim your own gift idea" }, 400);
-        const newClaimed = gift.claimed_by ? null : user.id;
-        await env.DB.prepare('UPDATE gift_lists SET claimed_by = ? WHERE id = ?').bind(newClaimed, giftId).run();
-        return json({ claimed: !!newClaimed });
-      }
-
-      const deleteGiftMatch = path.match(/^\/api\/gifts\/(\d+)$/);
-      if (deleteGiftMatch && request.method === 'DELETE') {
-        const giftId = deleteGiftMatch[1];
-        await env.DB.prepare('DELETE FROM gift_lists WHERE id = ? AND user_id = ?').bind(giftId, user.id).run();
-        return json({ ok: true });
-      }
-
-      // ── KK DRAW ───────────────────────────────────────────────────
-      if (path === '/api/kk' && request.method === 'GET') {
-        const draws = await env.DB.prepare('SELECT * FROM kk_draws ORDER BY year DESC').all();
-        return json(draws.results);
-      }
-
-      if (path === '/api/kk' && request.method === 'POST') {
-        const { year, budget } = await request.json();
-        const existing = await env.DB.prepare('SELECT id FROM kk_draws WHERE year = ?').bind(year).first();
-        if (existing) return json({ error: `KK draw for ${year} already exists` }, 400);
-        const draw = await env.DB.prepare(
-          'INSERT INTO kk_draws (year, budget) VALUES (?, ?) RETURNING *'
-        ).bind(year, budget || null).first();
-        return json(draw);
-      }
-
-      const drawMatch = path.match(/^\/api\/kk\/(\d+)\/draw$/);
-      if (drawMatch && request.method === 'POST') {
-        const drawId = drawMatch[1];
-        const { participant_ids } = await request.json();
-        if (participant_ids.length < 3) return json({ error: 'Need at least 3 participants' }, 400);
-        // Fisher-Yates shuffle, ensure no self-gifting
-        const ids = [...participant_ids];
-        let shuffled;
-        let attempts = 0;
-        do {
-          shuffled = [...ids].sort(() => Math.random() - 0.5);
-          attempts++;
-        } while (shuffled.some((id, i) => id === ids[i]) && attempts < 100);
-        await env.DB.prepare('DELETE FROM kk_assignments WHERE draw_id = ?').bind(drawId).run();
-        for (let i = 0; i < shuffled.length; i++) {
-          const giver = shuffled[i];
-          const receiver = shuffled[(i + 1) % shuffled.length];
-          await env.DB.prepare(
-            'INSERT INTO kk_assignments (draw_id, giver_id, receiver_id) VALUES (?, ?, ?)'
-          ).bind(drawId, giver, receiver).run();
-        }
-        await env.DB.prepare("UPDATE kk_draws SET status = 'drawn', drawn_at = CURRENT_TIMESTAMP WHERE id = ?").bind(drawId).run();
-        return json({ ok: true, count: shuffled.length });
-      }
-
-      const myAssignMatch = path.match(/^\/api\/kk\/(\d+)\/my-assignment$/);
-      if (myAssignMatch && request.method === 'GET') {
-        const drawId = myAssignMatch[1];
-        const assignment = await env.DB.prepare(`
-          SELECT ka.*, u.name as receiver_name, u.birthday as receiver_birthday
-          FROM kk_assignments ka JOIN users u ON ka.receiver_id = u.id
-          WHERE ka.draw_id = ? AND ka.giver_id = ?
-        `).bind(drawId, user.id).first();
-        return json(assignment || null);
-      }
-
-      // ── EXPENSES ──────────────────────────────────────────────────
-      if (path === '/api/expenses' && request.method === 'GET') {
-        const expenses = await env.DB.prepare(`
-          SELECT e.*, u.name as paid_by_name,
-            (SELECT SUM(CASE WHEN es.user_id = ? AND es.paid = 0 THEN es.amount ELSE 0 END)
-             FROM expense_splits es WHERE es.expense_id = e.id) as i_owe,
-            (SELECT GROUP_CONCAT(u2.name || ':' || es2.amount || ':' || es2.paid, '|')
-             FROM expense_splits es2 JOIN users u2 ON es2.user_id = u2.id WHERE es2.expense_id = e.id) as splits_raw
-          FROM expenses e JOIN users u ON e.paid_by = u.id
-          ORDER BY e.created_at DESC
-        `).bind(user.id).all();
-        return json(expenses.results);
-      }
-
-      if (path === '/api/expenses' && request.method === 'POST') {
-        const { description, total_amount, category, split_with } = await request.json();
-        const expense = await env.DB.prepare(
-          'INSERT INTO expenses (description, total_amount, paid_by, category) VALUES (?, ?, ?, ?) RETURNING *'
-        ).bind(description, total_amount, user.id, category || 'general').first();
-        const allPeople = [...new Set([user.id, ...(split_with || [])])];
-        const share = +(total_amount / allPeople.length).toFixed(2);
-        for (const uid of allPeople) {
-          await env.DB.prepare(
-            'INSERT INTO expense_splits (expense_id, user_id, amount, paid) VALUES (?, ?, ?, ?)'
-          ).bind(expense.id, uid, share, uid === user.id ? 1 : 0).run();
-        }
-        return json(expense);
-      }
-
-      const settleMatch = path.match(/^\/api\/expenses\/(\d+)\/settle$/);
-      if (settleMatch && request.method === 'POST') {
-        const expenseId = settleMatch[1];
-        await env.DB.prepare('UPDATE expense_splits SET paid = 1 WHERE expense_id = ? AND user_id = ?').bind(expenseId, user.id).run();
-        return json({ ok: true });
-      }
-
-      return json({ error: 'Route not found' }, 404);
-
-    } catch (e) {
-      return json({ error: e.message, stack: e.stack }, 500);
-    }
-  }
-};
-
-function sanitizeUser(u) {
-  if (!u) return null;
-  const { password_hash, invite_token, ...safe } = u;
-  return safe;
+// ─── SESSION / AUTH ───────────────────────────────────────────────────────────
+async function getSession(request, env) {
+  const token = request.headers.get('x-session-token') ||
+    (request.headers.get('cookie') || '').match(/session=([^;]+)/)?.[1];
+  if (!token) return null;
+  const row = await env.DB.prepare('SELECT * FROM sessions WHERE token=? AND expires_at > datetime("now")').bind(token).first();
+  if (!row) return null;
+  return await env.DB.prepare('SELECT * FROM users WHERE id=?').bind(row.user_id).first();
 }
 
-// ── EMBEDDED SPA ──────────────────────────────────────────────────────────────
+function json(data, status=200) {
+  return new Response(JSON.stringify(data), {status, headers:{'content-type':'application/json','access-control-allow-origin':'*'}});
+}
+function err(msg, status=400) { return json({error:msg}, status); }
+
+async function createNotif(env, userId, type, title, body, refId=null, refType=null) {
+  try {
+    await env.DB.prepare(
+      'INSERT INTO notifications (user_id,type,title,body,ref_id,ref_type) VALUES (?,?,?,?,?,?)'
+    ).bind(userId, type, title, body, refId, refType).run();
+  } catch {}
+}
+
+// ─── AUTH ROUTES ─────────────────────────────────────────────────────────────
+async function handleAuth(path, request, env) {
+  const method = request.method;
+
+  if (path === '/api/auth/invite' && method === 'GET') {
+    const token = new URL(request.url).searchParams.get('token');
+    const invite = await env.DB.prepare('SELECT * FROM invites WHERE token=? AND used=0').bind(token).first();
+    if (!invite) return err('Invalid or used invite', 404);
+    return json({name: invite.name, role: invite.role});
+  }
+
+  if (path === '/api/auth/register' && method === 'POST') {
+    const {token, name, password} = await request.json();
+    const invite = await env.DB.prepare('SELECT * FROM invites WHERE token=? AND used=0').bind(token).first();
+    if (!invite) return err('Invalid invite');
+    const salt = crypto.randomUUID();
+    const hash = await hashPassword(password, salt);
+    const userId = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO users (id,name,role,password_hash,salt,avatar_color) VALUES (?,?,?,?,?,?)').bind(
+      userId, name || invite.name, invite.role, hash, salt, invite.avatar_color || '#6366f1'
+    ).run();
+    await env.DB.prepare('UPDATE invites SET used=1,used_by=?,used_at=datetime("now") WHERE token=?').bind(userId, token).run();
+    // Add to family group chat (chat_id=1)
+    try { await env.DB.prepare('INSERT OR IGNORE INTO chat_members (chat_id,user_id) VALUES (1,?)').bind(userId).run(); } catch {}
+    const sessionToken = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO sessions (token,user_id,expires_at) VALUES (?,?,datetime("now","+"||?||" days"))').bind(sessionToken, userId, 30).run();
+    return json({token: sessionToken, user: {id:userId, name, role:invite.role}});
+  }
+
+  if (path === '/api/auth/login' && method === 'POST') {
+    const {name, password} = await request.json();
+    const user = await env.DB.prepare('SELECT * FROM users WHERE LOWER(name)=LOWER(?)').bind(name).first();
+    if (!user) return err('User not found', 401);
+    const hash = await hashPassword(password, user.salt);
+    if (hash !== user.password_hash) return err('Wrong password', 401);
+    const token = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO sessions (token,user_id,expires_at) VALUES (?,?,datetime("now","+30 days"))').bind(token, user.id).run();
+    return json({token, user: {id:user.id, name:user.name, role:user.role, avatar_color:user.avatar_color, avatar_url:user.avatar_url}});
+  }
+
+  if (path === '/api/auth/me' && method === 'GET') {
+    const user = await getSession(request, env);
+    if (!user) return err('Unauth', 401);
+    return json({id:user.id, name:user.name, role:user.role, avatar_color:user.avatar_color, avatar_url:user.avatar_url, bio:user.bio});
+  }
+
+  if (path === '/api/auth/logout' && method === 'POST') {
+    const token = request.headers.get('x-session-token') || (request.headers.get('cookie')||'').match(/session=([^;]+)/)?.[1];
+    if (token) await env.DB.prepare('DELETE FROM sessions WHERE token=?').bind(token).run();
+    return json({ok:true});
+  }
+
+  if (path === '/api/auth/profile' && method === 'PATCH') {
+    const user = await getSession(request, env);
+    if (!user) return err('Unauth', 401);
+    const {name, bio, avatar_color} = await request.json();
+    await env.DB.prepare('UPDATE users SET name=COALESCE(?,name), bio=COALESCE(?,bio), avatar_color=COALESCE(?,avatar_color) WHERE id=?')
+      .bind(name||null, bio||null, avatar_color||null, user.id).run();
+    return json({ok:true});
+  }
+
+  return null;
+}
+
+// ─── POSTS / FEED ─────────────────────────────────────────────────────────────
+async function handlePosts(path, request, env, user) {
+  const method = request.method;
+  const url = new URL(request.url);
+
+  if (path === '/api/posts' && method === 'GET') {
+    const limit = parseInt(url.searchParams.get('limit')||'20');
+    const offset = parseInt(url.searchParams.get('offset')||'0');
+    const posts = await env.DB.prepare(
+      `SELECT p.*, u.name as author_name, u.avatar_color, u.avatar_url,
+       (SELECT COUNT(*) FROM reactions WHERE ref_id=p.id AND ref_type='post') as reaction_count,
+       (SELECT COUNT(*) FROM comments WHERE post_id=p.id) as comment_count,
+       (SELECT reaction FROM reactions WHERE ref_id=p.id AND ref_type='post' AND user_id=?) as my_reaction
+       FROM posts p JOIN users u ON p.user_id=u.id ORDER BY p.created_at DESC LIMIT ? OFFSET ?`
+    ).bind(user.id, limit, offset).all();
+    // Attach media urls
+    const results = await Promise.all(posts.results.map(async p => {
+      let media = [];
+      try {
+        const m = await env.DB.prepare('SELECT * FROM post_media WHERE post_id=? ORDER BY position').bind(p.id).all();
+        media = m.results;
+      } catch {}
+      return {...p, media};
+    }));
+    return json(results);
+  }
+
+  if (path === '/api/posts' && method === 'POST') {
+    const ct = request.headers.get('content-type')||'';
+    let content='', media_keys=[];
+    if (ct.includes('multipart/form-data')) {
+      const fd = await request.formData();
+      content = fd.get('content')||'';
+      const files = fd.getAll('media');
+      for (const file of files) {
+        if (file && file.size > 0) {
+          const key = `posts/${user.id}/${Date.now()}-${Math.random().toString(36).slice(2)}.${file.name?.split('.').pop()||'jpg'}`;
+          await env.PHOTOS.put(key, file.stream(), {httpMetadata:{contentType:file.type||'image/jpeg'}});
+          media_keys.push(key);
+        }
+      }
+    } else {
+      const body = await request.json();
+      content = body.content || '';
+      media_keys = body.media_keys || [];
+    }
+    if (!content && media_keys.length === 0) return err('Empty post');
+    const postId = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO posts (id,user_id,content) VALUES (?,?,?)').bind(postId, user.id, content).run();
+    for (let i=0; i<media_keys.length; i++) {
+      await env.DB.prepare('INSERT INTO post_media (post_id,r2_key,media_type,position) VALUES (?,?,?,?)')
+        .bind(postId, media_keys[i], 'image', i).run();
+    }
+    return json({id:postId, ok:true}, 201);
+  }
+
+  // Reactions
+  const reactMatch = path.match(/^\/api\/posts\/([^/]+)\/react$/);
+  if (reactMatch && method === 'POST') {
+    const postId = reactMatch[1];
+    const {reaction} = await request.json();
+    const existing = await env.DB.prepare("SELECT * FROM reactions WHERE ref_id=? AND ref_type='post' AND user_id=?").bind(postId, user.id).first();
+    if (existing) {
+      if (existing.reaction === reaction) {
+        await env.DB.prepare("DELETE FROM reactions WHERE ref_id=? AND ref_type='post' AND user_id=?").bind(postId, user.id).run();
+      } else {
+        await env.DB.prepare("UPDATE reactions SET reaction=? WHERE ref_id=? AND ref_type='post' AND user_id=?").bind(reaction, postId, user.id).run();
+      }
+    } else {
+      await env.DB.prepare("INSERT INTO reactions (ref_id,ref_type,user_id,reaction) VALUES (?,'post',?,?)").bind(postId, user.id, reaction).run();
+      // Notify post author
+      const post = await env.DB.prepare('SELECT user_id FROM posts WHERE id=?').bind(postId).first();
+      if (post && post.user_id !== user.id) {
+        await createNotif(env, post.user_id, 'reaction', `${user.name} reacted`, `${user.name} reacted ${reaction} to your post`, postId, 'post');
+      }
+    }
+    const count = await env.DB.prepare("SELECT COUNT(*) as c FROM reactions WHERE ref_id=? AND ref_type='post'").bind(postId).first();
+    return json({count: count.c});
+  }
+
+  // Comments
+  const commentsMatch = path.match(/^\/api\/posts\/([^/]+)\/comments$/);
+  if (commentsMatch) {
+    const postId = commentsMatch[1];
+    if (method === 'GET') {
+      const comments = await env.DB.prepare(
+        'SELECT c.*, u.name, u.avatar_color FROM comments c JOIN users u ON c.user_id=u.id WHERE c.post_id=? ORDER BY c.created_at'
+      ).bind(postId).all();
+      return json(comments.results);
+    }
+    if (method === 'POST') {
+      const {content} = await request.json();
+      const id = crypto.randomUUID();
+      await env.DB.prepare('INSERT INTO comments (id,post_id,user_id,content) VALUES (?,?,?,?)').bind(id, postId, user.id, content).run();
+      const post = await env.DB.prepare('SELECT user_id FROM posts WHERE id=?').bind(postId).first();
+      if (post && post.user_id !== user.id) {
+        await createNotif(env, post.user_id, 'comment', `${user.name} commented`, `${user.name}: ${content.slice(0,60)}`, postId, 'post');
+      }
+      return json({id, ok:true}, 201);
+    }
+  }
+
+  return null;
+}
+
+// ─── PHOTO PROXY ─────────────────────────────────────────────────────────────
+async function handlePhotos(path, request, env, user) {
+  // GET /api/photos/:key* — proxy R2 object
+  if (request.method === 'GET') {
+    const key = decodeURIComponent(path.replace('/api/photos/', ''));
+    const obj = await env.PHOTOS.get(key);
+    if (!obj) return err('Not found', 404);
+    const headers = new Headers();
+    obj.writeHttpMetadata(headers);
+    headers.set('cache-control', 'public, max-age=86400');
+    return new Response(obj.body, {headers});
+  }
+  // POST /api/photos/upload — generic upload
+  if (request.method === 'POST') {
+    const fd = await request.formData();
+    const file = fd.get('file');
+    if (!file) return err('No file');
+    const folder = fd.get('folder') || 'uploads';
+    const key = `${folder}/${user.id}/${Date.now()}-${Math.random().toString(36).slice(2)}.${file.name?.split('.').pop()||'bin'}`;
+    await env.PHOTOS.put(key, file.stream(), {httpMetadata:{contentType:file.type||'application/octet-stream'}});
+    return json({key, url:`/api/photos/${encodeURIComponent(key)}`}, 201);
+  }
+  return null;
+}
+
+
+// Family Hub v2 - Part 2: Chats (SSE + encrypted), Stories, Events, Transfers, Notifications, Documents
+
+// ─── CHATS ────────────────────────────────────────────────────────────────────
+async function handleChats(path, request, env, user) {
+  const method = request.method;
+
+  if (path === '/api/chats' && method === 'GET') {
+    const chats = await env.DB.prepare(
+      `SELECT c.*,
+       (SELECT COUNT(*) FROM chat_members WHERE chat_id=c.id) as member_count,
+       (SELECT content FROM messages WHERE chat_id=c.id ORDER BY created_at DESC LIMIT 1) as last_msg_enc,
+       (SELECT created_at FROM messages WHERE chat_id=c.id ORDER BY created_at DESC LIMIT 1) as last_msg_at,
+       (SELECT u2.name FROM messages m2 JOIN users u2 ON m2.user_id=u2.id WHERE m2.chat_id=c.id ORDER BY m2.created_at DESC LIMIT 1) as last_sender
+       FROM chats c
+       JOIN chat_members cm ON cm.chat_id=c.id AND cm.user_id=?
+       ORDER BY COALESCE(last_msg_at, c.created_at) DESC`
+    ).bind(user.id).all();
+
+    const results = await Promise.all(chats.results.map(async c => {
+      let last_msg = '';
+      if (c.last_msg_enc) {
+        try { last_msg = await decryptMsg(c.last_msg_enc, c.id, env.ENCRYPTION_KEY); } catch { last_msg = '🔒'; }
+      }
+      const members = await env.DB.prepare(
+        'SELECT u.id,u.name,u.avatar_color,u.avatar_url FROM users u JOIN chat_members cm ON cm.user_id=u.id WHERE cm.chat_id=?'
+      ).bind(c.id).all();
+      return {...c, last_msg, members: members.results, last_msg_enc: undefined};
+    }));
+    return json(results);
+  }
+
+  if (path === '/api/chats' && method === 'POST') {
+    const {name, member_ids, is_group} = await request.json();
+    const chatId = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO chats (id,name,is_group,created_by) VALUES (?,?,?,?)').bind(chatId, name||null, is_group?1:0, user.id).run();
+    const allMembers = [...new Set([user.id, ...(member_ids||[])])];
+    for (const uid of allMembers) {
+      await env.DB.prepare('INSERT OR IGNORE INTO chat_members (chat_id,user_id) VALUES (?,?)').bind(chatId, uid).run();
+    }
+    return json({id: chatId, ok:true}, 201);
+  }
+
+  // Messages
+  const msgsMatch = path.match(/^\/api\/chats\/([^/]+)\/messages$/);
+  if (msgsMatch) {
+    const chatId = msgsMatch[1];
+    const isMember = await env.DB.prepare('SELECT 1 FROM chat_members WHERE chat_id=? AND user_id=?').bind(chatId, user.id).first();
+    if (!isMember) return err('Not a member', 403);
+
+    if (method === 'GET') {
+      const limit = parseInt(new URL(request.url).searchParams.get('limit')||'50');
+      const before = new URL(request.url).searchParams.get('before');
+      let query, args;
+      if (before) {
+        query = 'SELECT m.*,u.name as sender_name,u.avatar_color FROM messages m JOIN users u ON m.user_id=u.id WHERE m.chat_id=? AND m.created_at < ? ORDER BY m.created_at DESC LIMIT ?';
+        args = [chatId, before, limit];
+      } else {
+        query = 'SELECT m.*,u.name as sender_name,u.avatar_color FROM messages m JOIN users u ON m.user_id=u.id WHERE m.chat_id=? ORDER BY m.created_at DESC LIMIT ?';
+        args = [chatId, limit];
+      }
+      const msgs = await env.DB.prepare(query).bind(...args).all();
+      const decrypted = await Promise.all(msgs.results.reverse().map(async m => {
+        let content = m.content;
+        if (m.encrypted && env.ENCRYPTION_KEY) {
+          try { content = await decryptMsg(m.content, chatId, env.ENCRYPTION_KEY); } catch {}
+        }
+        let reactions = [];
+        try {
+          const r = await env.DB.prepare("SELECT reaction,COUNT(*) as c FROM reactions WHERE ref_id=? AND ref_type='message' GROUP BY reaction").bind(m.id).all();
+          reactions = r.results;
+        } catch {}
+        return {...m, content, reactions};
+      }));
+      return json(decrypted);
+    }
+
+    if (method === 'POST') {
+      const ct = request.headers.get('content-type')||'';
+      let content='', media_key=null, msg_type='text', reply_to=null;
+      if (ct.includes('multipart/form-data')) {
+        const fd = await request.formData();
+        content = fd.get('content')||'';
+        const file = fd.get('file');
+        msg_type = fd.get('type')||'text';
+        reply_to = fd.get('reply_to')||null;
+        if (file && file.size > 0) {
+          media_key = `chats/${chatId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${file.name?.split('.').pop()||'bin'}`;
+          await env.PHOTOS.put(media_key, file.stream(), {httpMetadata:{contentType:file.type||'application/octet-stream'}});
+          msg_type = file.type?.startsWith('image/') ? 'image' : 'file';
+        }
+      } else {
+        const body = await request.json();
+        content = body.content || '';
+        msg_type = body.type || 'text';
+        reply_to = body.reply_to || null;
+      }
+
+      let storedContent = content;
+      let encrypted = 0;
+      if (content && env.ENCRYPTION_KEY) {
+        storedContent = await encryptMsg(content, chatId, env.ENCRYPTION_KEY);
+        encrypted = 1;
+      }
+
+      const msgId = crypto.randomUUID();
+      await env.DB.prepare('INSERT INTO messages (id,chat_id,user_id,content,encrypted,msg_type,media_key,reply_to) VALUES (?,?,?,?,?,?,?,?)')
+        .bind(msgId, chatId, user.id, storedContent, encrypted, msg_type, media_key, reply_to).run();
+
+      // Notify other members
+      const members = await env.DB.prepare('SELECT user_id FROM chat_members WHERE chat_id=? AND user_id!=?').bind(chatId, user.id).all();
+      const chat = await env.DB.prepare('SELECT name FROM chats WHERE id=?').bind(chatId).first();
+      const notifBody = content ? content.slice(0,80) : `sent a ${msg_type}`;
+      for (const m of members.results) {
+        await createNotif(env, m.user_id, 'message', `${user.name}`, notifBody, chatId, 'chat');
+      }
+
+      return json({id:msgId, content, encrypted:false, ok:true}, 201);
+    }
+  }
+
+  // Message reactions
+  const msgReactMatch = path.match(/^\/api\/chats\/([^/]+)\/messages\/([^/]+)\/react$/);
+  if (msgReactMatch && method === 'POST') {
+    const [,chatId, msgId] = msgReactMatch;
+    const {reaction} = await request.json();
+    const existing = await env.DB.prepare("SELECT * FROM reactions WHERE ref_id=? AND ref_type='message' AND user_id=?").bind(msgId, user.id).first();
+    if (existing) {
+      if (existing.reaction === reaction) await env.DB.prepare("DELETE FROM reactions WHERE ref_id=? AND ref_type='message' AND user_id=?").bind(msgId, user.id).run();
+      else await env.DB.prepare("UPDATE reactions SET reaction=? WHERE ref_id=? AND ref_type='message' AND user_id=?").bind(reaction, msgId, user.id).run();
+    } else {
+      await env.DB.prepare("INSERT INTO reactions (ref_id,ref_type,user_id,reaction) VALUES (?,'message',?,?)").bind(msgId, user.id, reaction).run();
+    }
+    return json({ok:true});
+  }
+
+  // SSE stream
+  const streamMatch = path.match(/^\/api\/chats\/([^/]+)\/stream$/);
+  if (streamMatch && method === 'GET') {
+    const chatId = streamMatch[1];
+    const isMember = await env.DB.prepare('SELECT 1 FROM chat_members WHERE chat_id=? AND user_id=?').bind(chatId, user.id).first();
+    if (!isMember) return err('Not a member', 403);
+
+    // Simple long-poll: return latest msgs since timestamp
+    const since = new URL(request.url).searchParams.get('since') || new Date(Date.now()-5000).toISOString();
+    const msgs = await env.DB.prepare(
+      'SELECT m.*,u.name as sender_name,u.avatar_color FROM messages m JOIN users u ON m.user_id=u.id WHERE m.chat_id=? AND m.created_at > ? ORDER BY m.created_at LIMIT 50'
+    ).bind(chatId, since).all();
+    const decrypted = await Promise.all(msgs.results.map(async m => {
+      let content = m.content;
+      if (m.encrypted && env.ENCRYPTION_KEY) { try { content = await decryptMsg(m.content, chatId, env.ENCRYPTION_KEY); } catch {} }
+      return {...m, content};
+    }));
+    return json(decrypted);
+  }
+
+  // Users list (for new chat)
+  if (path === '/api/users' && method === 'GET') {
+    const users = await env.DB.prepare('SELECT id,name,role,avatar_color,avatar_url FROM users ORDER BY name').all();
+    return json(users.results);
+  }
+
+  return null;
+}
+
+// ─── STORIES ─────────────────────────────────────────────────────────────────
+async function handleStories(path, request, env, user) {
+  const method = request.method;
+
+  if (path === '/api/stories' && method === 'GET') {
+    // Clean expired
+    await env.DB.prepare("DELETE FROM stories WHERE expires_at <= datetime('now')").run();
+    const stories = await env.DB.prepare(
+      `SELECT s.*, u.name, u.avatar_color, u.avatar_url,
+       (SELECT 1 FROM story_views WHERE story_id=s.id AND user_id=?) as seen
+       FROM stories s JOIN users u ON s.user_id=u.id
+       WHERE s.expires_at > datetime('now') ORDER BY s.created_at DESC`
+    ).bind(user.id).all();
+    return json(stories.results);
+  }
+
+  if (path === '/api/stories' && method === 'POST') {
+    const ct = request.headers.get('content-type')||'';
+    let content='', media_key=null, story_type='text', bg_color='#6366f1';
+    if (ct.includes('multipart/form-data')) {
+      const fd = await request.formData();
+      content = fd.get('content')||'';
+      bg_color = fd.get('bg_color')||bg_color;
+      const file = fd.get('media');
+      if (file && file.size > 0) {
+        media_key = `stories/${user.id}/${Date.now()}.${file.name?.split('.').pop()||'jpg'}`;
+        await env.PHOTOS.put(media_key, file.stream(), {httpMetadata:{contentType:file.type||'image/jpeg'}});
+        story_type = 'image';
+      }
+    } else {
+      const body = await request.json();
+      content = body.content||''; bg_color = body.bg_color||bg_color; story_type = body.type||'text';
+    }
+    const id = crypto.randomUUID();
+    await env.DB.prepare("INSERT INTO stories (id,user_id,content,media_key,story_type,bg_color,expires_at) VALUES (?,?,?,?,?,?,datetime('now','+24 hours'))")
+      .bind(id, user.id, content, media_key, story_type, bg_color).run();
+    return json({id, ok:true}, 201);
+  }
+
+  const viewMatch = path.match(/^\/api\/stories\/([^/]+)\/view$/);
+  if (viewMatch && method === 'POST') {
+    const storyId = viewMatch[1];
+    await env.DB.prepare('INSERT OR IGNORE INTO story_views (story_id,user_id) VALUES (?,?)').bind(storyId, user.id).run();
+    return json({ok:true});
+  }
+
+  return null;
+}
+
+// ─── EVENTS / CALENDAR ───────────────────────────────────────────────────────
+async function handleEvents(path, request, env, user) {
+  const method = request.method;
+
+  if (path === '/api/events' && method === 'GET') {
+    const events = await env.DB.prepare(
+      `SELECT e.*, u.name as creator_name,
+       (SELECT COUNT(*) FROM event_rsvps WHERE event_id=e.id AND status='going') as going_count,
+       (SELECT status FROM event_rsvps WHERE event_id=e.id AND user_id=?) as my_rsvp
+       FROM events e JOIN users u ON e.created_by=u.id ORDER BY e.starts_at`
+    ).bind(user.id).all();
+    return json(events.results);
+  }
+
+  if (path === '/api/events' && method === 'POST') {
+    const {title, description, starts_at, ends_at, location} = await request.json();
+    const id = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO events (id,title,description,starts_at,ends_at,location,created_by) VALUES (?,?,?,?,?,?,?)')
+      .bind(id, title, description||null, starts_at, ends_at||null, location||null, user.id).run();
+    // Notify all users
+    const users = await env.DB.prepare('SELECT id FROM users WHERE id!=?').bind(user.id).all();
+    for (const u2 of users.results) {
+      await createNotif(env, u2.id, 'event', `New event: ${title}`, `${user.name} added an event on ${starts_at.slice(0,10)}`, id, 'event');
+    }
+    return json({id, ok:true}, 201);
+  }
+
+  const rsvpMatch = path.match(/^\/api\/events\/([^/]+)\/rsvp$/);
+  if (rsvpMatch && method === 'POST') {
+    const eventId = rsvpMatch[1];
+    const {status} = await request.json(); // going | maybe | no
+    await env.DB.prepare('INSERT OR REPLACE INTO event_rsvps (event_id,user_id,status) VALUES (?,?,?)').bind(eventId, user.id, status).run();
+    return json({ok:true});
+  }
+
+  return null;
+}
+
+// ─── TRANSFERS (fund) ─────────────────────────────────────────────────────────
+async function handleTransfers(path, request, env, user) {
+  const method = request.method;
+
+  if (path === '/api/transfers' && method === 'GET') {
+    const transfers = await env.DB.prepare(
+      `SELECT t.*,
+       uf.name as from_name, uf.avatar_color as from_color,
+       ut.name as to_name, ut.avatar_color as to_color
+       FROM transfers t
+       JOIN users uf ON t.from_user_id=uf.id
+       JOIN users ut ON t.to_user_id=ut.id
+       WHERE t.from_user_id=? OR t.to_user_id=?
+       ORDER BY t.created_at DESC LIMIT 50`
+    ).bind(user.id, user.id).all();
+    return json(transfers.results);
+  }
+
+  if (path === '/api/transfers/balance' && method === 'GET') {
+    const sent = await env.DB.prepare("SELECT SUM(amount) as s FROM transfers WHERE from_user_id=? AND status='confirmed'").bind(user.id).first();
+    const received = await env.DB.prepare("SELECT SUM(amount) as s FROM transfers WHERE to_user_id=? AND status='confirmed'").bind(user.id).first();
+    // Per-user breakdown
+    const balances = await env.DB.prepare(
+      `SELECT
+        CASE WHEN t.from_user_id=? THEN t.to_user_id ELSE t.from_user_id END as other_id,
+        CASE WHEN t.from_user_id=? THEN -t.amount ELSE t.amount END as net,
+        u.name as other_name
+       FROM transfers t
+       JOIN users u ON u.id = CASE WHEN t.from_user_id=? THEN t.to_user_id ELSE t.from_user_id END
+       WHERE (t.from_user_id=? OR t.to_user_id=?) AND t.status='confirmed'`
+    ).bind(user.id, user.id, user.id, user.id, user.id).all();
+    // Aggregate by other_id
+    const agg = {};
+    for (const row of balances.results) {
+      if (!agg[row.other_id]) agg[row.other_id] = {other_id:row.other_id, other_name:row.other_name, net:0};
+      agg[row.other_id].net += row.net;
+    }
+    return json({total_sent: sent?.s||0, total_received: received?.s||0, balances: Object.values(agg)});
+  }
+
+  if (path === '/api/transfers' && method === 'POST') {
+    const {to_user_id, amount, note, currency} = await request.json();
+    if (!to_user_id || !amount || amount <= 0) return err('Invalid transfer');
+    if (to_user_id === user.id) return err('Cannot transfer to yourself');
+    const id = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO transfers (id,from_user_id,to_user_id,amount,currency,note,status) VALUES (?,?,?,?,?,?,?)')
+      .bind(id, user.id, to_user_id, amount, currency||'EUR', note||null, 'pending').run();
+    await createNotif(env, to_user_id, 'transfer', `${user.name} sent you €${amount}`, note||'Tap to confirm or reject', id, 'transfer');
+    return json({id, ok:true}, 201);
+  }
+
+  const actionMatch = path.match(/^\/api\/transfers\/([^/]+)\/(confirm|reject)$/);
+  if (actionMatch && method === 'POST') {
+    const [, transferId, action] = actionMatch;
+    const transfer = await env.DB.prepare('SELECT * FROM transfers WHERE id=?').bind(transferId).first();
+    if (!transfer) return err('Not found', 404);
+    if (transfer.to_user_id !== user.id) return err('Not your transfer', 403);
+    if (transfer.status !== 'pending') return err('Already processed');
+    await env.DB.prepare('UPDATE transfers SET status=? WHERE id=?').bind(action==='confirm'?'confirmed':'rejected', transferId).run();
+    await createNotif(env, transfer.from_user_id, 'transfer', `Transfer ${action}ed`, `${user.name} ${action}ed your €${transfer.amount} transfer`, transferId, 'transfer');
+    return json({ok:true});
+  }
+
+  return null;
+}
+
+// ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
+async function handleNotifications(path, request, env, user) {
+  const method = request.method;
+
+  if (path === '/api/notifications' && method === 'GET') {
+    const notifs = await env.DB.prepare(
+      'SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50'
+    ).bind(user.id).all();
+    const unread = await env.DB.prepare('SELECT COUNT(*) as c FROM notifications WHERE user_id=? AND read=0').bind(user.id).first();
+    return json({items: notifs.results, unread: unread?.c||0});
+  }
+
+  if (path === '/api/notifications/read-all' && method === 'POST') {
+    await env.DB.prepare('UPDATE notifications SET read=1 WHERE user_id=?').bind(user.id).run();
+    return json({ok:true});
+  }
+
+  const readMatch = path.match(/^\/api\/notifications\/([^/]+)\/read$/);
+  if (readMatch && method === 'POST') {
+    await env.DB.prepare('UPDATE notifications SET read=1 WHERE id=? AND user_id=?').bind(readMatch[1], user.id).run();
+    return json({ok:true});
+  }
+
+  return null;
+}
+
+// ─── DOCUMENTS VAULT ─────────────────────────────────────────────────────────
+async function handleDocuments(path, request, env, user) {
+  const method = request.method;
+
+  if (path === '/api/documents' && method === 'GET') {
+    const mine = new URL(request.url).searchParams.get('mine') === '1';
+    let docs;
+    if (mine) {
+      docs = await env.DB.prepare('SELECT id,name,doc_type,size_bytes,owner_id,created_at FROM documents WHERE owner_id=? ORDER BY created_at DESC').bind(user.id).all();
+    } else {
+      docs = await env.DB.prepare('SELECT d.id,d.name,d.doc_type,d.size_bytes,d.owner_id,d.created_at,u.name as owner_name FROM documents d JOIN users u ON d.owner_id=u.id WHERE d.shared=1 OR d.owner_id=? ORDER BY d.created_at DESC').bind(user.id).all();
+    }
+    return json(docs.results);
+  }
+
+  if (path === '/api/documents/upload' && method === 'POST') {
+    const fd = await request.formData();
+    const file = fd.get('file');
+    const name = fd.get('name') || file?.name || 'Untitled';
+    const shared = fd.get('shared') === '1' ? 1 : 0;
+    const doc_type = fd.get('doc_type') || 'other';
+    if (!file) return err('No file');
+
+    const docId = crypto.randomUUID();
+    const fileBytes = await file.arrayBuffer();
+    const encrypted = await encryptDoc(new Uint8Array(fileBytes), docId, env.ENCRYPTION_KEY||'fallback-key');
+    const key = `documents/${user.id}/${docId}`;
+    await env.PHOTOS.put(key, encrypted, {httpMetadata:{contentType:'application/octet-stream'}});
+
+    await env.DB.prepare('INSERT INTO documents (id,name,doc_type,r2_key,owner_id,shared,size_bytes) VALUES (?,?,?,?,?,?,?)')
+      .bind(docId, name, doc_type, key, user.id, shared, file.size).run();
+
+    return json({id:docId, ok:true}, 201);
+  }
+
+  const dlMatch = path.match(/^\/api\/documents\/([^/]+)\/download$/);
+  if (dlMatch && method === 'GET') {
+    const docId = dlMatch[1];
+    const doc = await env.DB.prepare('SELECT * FROM documents WHERE id=?').bind(docId).first();
+    if (!doc) return err('Not found', 404);
+    if (doc.owner_id !== user.id && !doc.shared) return err('Forbidden', 403);
+    const obj = await env.PHOTOS.get(doc.r2_key);
+    if (!obj) return err('File not found', 404);
+    const encrypted = new Uint8Array(await obj.arrayBuffer());
+    const decrypted = await decryptDoc(encrypted, docId, env.ENCRYPTION_KEY||'fallback-key');
+    if (!decrypted) return err('Decryption failed', 500);
+    return new Response(decrypted, {headers:{
+      'content-type': 'application/octet-stream',
+      'content-disposition': `attachment; filename="${doc.name}"`,
+      'access-control-allow-origin': '*'
+    }});
+  }
+
+  return null;
+}
+
+
+// Family Hub v2 - Part 3: Birthdays, Gifts, KK Draw, Expenses
+
+async function handleBirthdays(path, request, env, user) {
+  const method = request.method;
+
+  if (path === '/api/birthdays' && method === 'GET') {
+    const bdays = await env.DB.prepare(
+      `SELECT b.*, u.name, u.avatar_color FROM birthdays b JOIN users u ON b.user_id=u.id ORDER BY
+       CASE WHEN strftime('%m-%d', b.date) >= strftime('%m-%d','now')
+       THEN strftime('%m-%d', b.date)
+       ELSE strftime('%m-%d', b.date, '+1 year') END`
+    ).all();
+    return json(bdays.results);
+  }
+
+  if (path === '/api/birthdays' && method === 'POST') {
+    const {date} = await request.json();
+    await env.DB.prepare('INSERT OR REPLACE INTO birthdays (user_id,date) VALUES (?,?)').bind(user.id, date).run();
+    return json({ok:true});
+  }
+
+  return null;
+}
+
+async function handleGifts(path, request, env, user) {
+  const method = request.method;
+
+  if (path === '/api/gifts' && method === 'GET') {
+    const for_user = new URL(request.url).searchParams.get('user');
+    let gifts;
+    if (for_user) {
+      // Don't show claimed_by to the person whose list it is
+      if (for_user === user.id) {
+        gifts = await env.DB.prepare('SELECT id,user_id,title,description,url,price,status FROM gifts WHERE user_id=? ORDER BY created_at DESC').bind(for_user).all();
+      } else {
+        gifts = await env.DB.prepare(
+          `SELECT g.*, CASE WHEN g.claimed_by=? THEN 'you' WHEN g.claimed_by IS NOT NULL THEN 'someone' ELSE NULL END as claimed_by_label
+           FROM gifts g WHERE g.user_id=? ORDER BY g.created_at DESC`
+        ).bind(user.id, for_user).all();
+      }
+    } else {
+      gifts = await env.DB.prepare('SELECT g.*,u.name as owner_name FROM gifts g JOIN users u ON g.user_id=u.id ORDER BY g.created_at DESC').all();
+    }
+    return json(gifts.results);
+  }
+
+  if (path === '/api/gifts' && method === 'POST') {
+    const {title, description, url, price} = await request.json();
+    const id = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO gifts (id,user_id,title,description,url,price) VALUES (?,?,?,?,?,?)').bind(id, user.id, title, description||null, url||null, price||null).run();
+    return json({id, ok:true}, 201);
+  }
+
+  const claimMatch = path.match(/^\/api\/gifts\/([^/]+)\/claim$/);
+  if (claimMatch && method === 'POST') {
+    const giftId = claimMatch[1];
+    const gift = await env.DB.prepare('SELECT * FROM gifts WHERE id=?').bind(giftId).first();
+    if (!gift) return err('Not found', 404);
+    if (gift.user_id === user.id) return err('Cannot claim your own gift');
+    if (gift.claimed_by && gift.claimed_by !== user.id) return err('Already claimed');
+    if (gift.claimed_by === user.id) {
+      await env.DB.prepare("UPDATE gifts SET claimed_by=NULL,status='available' WHERE id=?").bind(giftId).run();
+    } else {
+      await env.DB.prepare("UPDATE gifts SET claimed_by=?,status='claimed' WHERE id=?").bind(user.id, giftId).run();
+    }
+    return json({ok:true});
+  }
+
+  const deleteGiftMatch = path.match(/^\/api\/gifts\/([^/]+)$/);
+  if (deleteGiftMatch && method === 'DELETE') {
+    const giftId = deleteGiftMatch[1];
+    const gift = await env.DB.prepare('SELECT * FROM gifts WHERE id=?').bind(giftId).first();
+    if (!gift) return err('Not found', 404);
+    if (gift.user_id !== user.id) return err('Forbidden', 403);
+    await env.DB.prepare('DELETE FROM gifts WHERE id=?').bind(giftId).run();
+    return json({ok:true});
+  }
+
+  return null;
+}
+
+async function handleKK(path, request, env, user) {
+  const method = request.method;
+
+  if (path === '/api/kk' && method === 'GET') {
+    const year = new URL(request.url).searchParams.get('year') || new Date().getFullYear();
+    const draw = await env.DB.prepare('SELECT * FROM kk_draws WHERE year=?').bind(year).first();
+    if (!draw) return json(null);
+    const participants = await env.DB.prepare(
+      'SELECT kp.*,u.name,u.avatar_color FROM kk_participants kp JOIN users u ON kp.user_id=u.id WHERE kp.draw_id=?'
+    ).bind(draw.id).all();
+    let my_assignment = null;
+    if (draw.drawn) {
+      const assign = await env.DB.prepare('SELECT * FROM kk_assignments WHERE draw_id=? AND giver_id=?').bind(draw.id, user.id).first();
+      if (assign) {
+        const recipient = await env.DB.prepare('SELECT id,name,avatar_color FROM users WHERE id=?').bind(assign.recipient_id).first();
+        my_assignment = recipient;
+      }
+    }
+    return json({...draw, participants: participants.results, my_assignment});
+  }
+
+  if (path === '/api/kk' && method === 'POST') {
+    const {year, budget} = await request.json();
+    const existing = await env.DB.prepare('SELECT id FROM kk_draws WHERE year=?').bind(year).first();
+    if (existing) return err('Draw for this year exists');
+    const id = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO kk_draws (id,year,budget,created_by) VALUES (?,?,?,?)').bind(id, year, budget||50, user.id).run();
+    return json({id, ok:true}, 201);
+  }
+
+  if (path === '/api/kk/join' && method === 'POST') {
+    const {draw_id, wish} = await request.json();
+    await env.DB.prepare('INSERT OR REPLACE INTO kk_participants (draw_id,user_id,wish) VALUES (?,?,?)').bind(draw_id, user.id, wish||null).run();
+    return json({ok:true});
+  }
+
+  if (path === '/api/kk/draw' && method === 'POST') {
+    const {draw_id} = await request.json();
+    const draw = await env.DB.prepare('SELECT * FROM kk_draws WHERE id=?').bind(draw_id).first();
+    if (!draw) return err('Draw not found', 404);
+    if (draw.drawn) return err('Already drawn');
+
+    const participants = await env.DB.prepare('SELECT user_id FROM kk_participants WHERE draw_id=?').bind(draw_id).all();
+    const ids = participants.results.map(p => p.user_id);
+    if (ids.length < 2) return err('Need at least 2 participants');
+
+    // Shuffle with Fisher-Yates
+    const shuffled = [...ids];
+    for (let i = shuffled.length-1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i+1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    // Assign: person[i] gives to person[i+1], last gives to first
+    for (let i=0; i<ids.length; i++) {
+      const giver = ids[i];
+      const recipient = shuffled[(i+1) % shuffled.length] === giver ? shuffled[i] : shuffled[(i+1) % shuffled.length];
+      // Simple valid assignment
+      await env.DB.prepare('INSERT INTO kk_assignments (draw_id,giver_id,recipient_id) VALUES (?,?,?)').bind(draw_id, ids[i], shuffled[i===ids.length-1?0:i+1]).run();
+      await createNotif(env, ids[i], 'kk', '🎅 KK Draw Complete!', `You have your secret santa assignment! Check the KK tab.`, draw_id, 'kk');
+    }
+    await env.DB.prepare('UPDATE kk_draws SET drawn=1 WHERE id=?').bind(draw_id).run();
+    return json({ok:true});
+  }
+
+  return null;
+}
+
+async function handleExpenses(path, request, env, user) {
+  const method = request.method;
+
+  if (path === '/api/expenses' && method === 'GET') {
+    const expenses = await env.DB.prepare(
+      `SELECT e.*,u.name as paid_by_name,u.avatar_color
+       FROM expenses e JOIN users u ON e.paid_by=u.id
+       ORDER BY e.created_at DESC LIMIT 100`
+    ).all();
+    const results = await Promise.all(expenses.results.map(async exp => {
+      const splits = await env.DB.prepare(
+        'SELECT es.*,u.name FROM expense_splits es JOIN users u ON es.user_id=u.id WHERE es.expense_id=?'
+      ).bind(exp.id).all();
+      return {...exp, splits: splits.results};
+    }));
+    return json(results);
+  }
+
+  if (path === '/api/expenses/summary' && method === 'GET') {
+    const owed_to_me = await env.DB.prepare(
+      "SELECT SUM(amount) as s FROM expense_splits WHERE user_id!=? AND expense_id IN (SELECT id FROM expenses WHERE paid_by=?) AND settled=0"
+    ).bind(user.id, user.id).first();
+    const i_owe = await env.DB.prepare(
+      "SELECT SUM(amount) as s FROM expense_splits WHERE user_id=? AND settled=0 AND expense_id NOT IN (SELECT id FROM expenses WHERE paid_by=?)"
+    ).bind(user.id, user.id).first();
+    return json({owed_to_me: owed_to_me?.s||0, i_owe: i_owe?.s||0});
+  }
+
+  if (path === '/api/expenses' && method === 'POST') {
+    const {description, amount, currency, category, splits} = await request.json();
+    const id = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO expenses (id,description,amount,currency,category,paid_by) VALUES (?,?,?,?,?,?)')
+      .bind(id, description, amount, currency||'EUR', category||'other', user.id).run();
+    for (const split of (splits||[])) {
+      await env.DB.prepare('INSERT INTO expense_splits (expense_id,user_id,amount) VALUES (?,?,?)').bind(id, split.user_id, split.amount).run();
+      if (split.user_id !== user.id) {
+        await createNotif(env, split.user_id, 'expense', `${user.name} added an expense`, `You owe €${split.amount} for "${description}"`, id, 'expense');
+      }
+    }
+    return json({id, ok:true}, 201);
+  }
+
+  const settleMatch = path.match(/^\/api\/expenses\/([^/]+)\/settle$/);
+  if (settleMatch && method === 'POST') {
+    const expId = settleMatch[1];
+    await env.DB.prepare('UPDATE expense_splits SET settled=1 WHERE expense_id=? AND user_id=?').bind(expId, user.id).run();
+    return json({ok:true});
+  }
+
+  return null;
+}
+
+
 function getSPA() {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#FF6B6B">
+<meta name="theme-color" content="#4f46e5">
 <title>Family Hub 🏠</title>
 <style>
-  :root {
-    --primary: #FF6B6B;
-    --primary-dark: #e05555;
-    --accent: #FFE66D;
-    --bg: #FFF8F3;
-    --card: #FFFFFF;
-    --text: #2D2D2D;
-    --muted: #888;
-    --border: #F0E8E8;
-    --nav-height: 64px;
-    --safe-bottom: env(safe-area-inset-bottom, 0px);
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height: 100dvh; }
-  #app { max-width: 480px; margin: 0 auto; position: relative; min-height: 100dvh; }
-
-  /* AUTH */
-  .auth-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100dvh; padding: 24px; background: linear-gradient(135deg, #FF6B6B 0%, #FF8E53 100%); }
-  .auth-logo { font-size: 64px; margin-bottom: 8px; }
-  .auth-title { font-size: 28px; font-weight: 800; color: white; margin-bottom: 4px; }
-  .auth-sub { color: rgba(255,255,255,0.85); font-size: 15px; margin-bottom: 32px; text-align: center; }
-  .auth-card { background: white; border-radius: 20px; padding: 24px; width: 100%; max-width: 360px; box-shadow: 0 8px 32px rgba(0,0,0,0.15); }
-  .auth-tabs { display: flex; margin-bottom: 20px; border-radius: 10px; overflow: hidden; border: 2px solid var(--border); }
-  .auth-tab { flex: 1; padding: 10px; text-align: center; font-size: 14px; font-weight: 600; cursor: pointer; background: none; border: none; color: var(--muted); }
-  .auth-tab.active { background: var(--primary); color: white; }
-  .form-group { margin-bottom: 16px; }
-  .form-group label { display: block; font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 12px 14px; border: 2px solid var(--border); border-radius: 12px; font-size: 15px; outline: none; transition: border-color 0.2s; font-family: inherit; }
-  .form-group input:focus, .form-group select:focus, .form-group textarea:focus { border-color: var(--primary); }
-  .btn { width: 100%; padding: 14px; background: var(--primary); color: white; border: none; border-radius: 12px; font-size: 16px; font-weight: 700; cursor: pointer; transition: background 0.2s; }
-  .btn:hover { background: var(--primary-dark); }
-  .btn:disabled { opacity: 0.6; cursor: not-allowed; }
-  .btn-ghost { background: transparent; color: var(--primary); border: 2px solid var(--primary); }
-  .btn-ghost:hover { background: var(--primary); color: white; }
-  .btn-sm { padding: 8px 14px; font-size: 13px; width: auto; border-radius: 8px; }
-  .error-msg { color: #e74c3c; font-size: 13px; margin-top: 8px; padding: 8px 12px; background: #ffeaea; border-radius: 8px; }
-
-  /* MAIN APP */
-  .main-app { display: none; flex-direction: column; min-height: 100dvh; }
-  .main-app.visible { display: flex; }
-  .header { background: var(--primary); color: white; padding: 16px 16px 12px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 10; }
-  .header-title { font-size: 20px; font-weight: 800; }
-  .header-sub { font-size: 13px; opacity: 0.85; }
-  .header-avatar { width: 36px; height: 36px; border-radius: 50%; background: rgba(255,255,255,0.3); display: flex; align-items: center; justify-content: center; font-size: 18px; cursor: pointer; overflow: hidden; }
-  .header-avatar img { width: 100%; height: 100%; object-fit: cover; }
-  .content { flex: 1; overflow-y: auto; padding-bottom: calc(var(--nav-height) + var(--safe-bottom) + 16px); }
-  .bottom-nav { position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: 100%; max-width: 480px; height: calc(var(--nav-height) + var(--safe-bottom)); background: white; border-top: 1px solid var(--border); display: flex; padding-bottom: var(--safe-bottom); z-index: 10; box-shadow: 0 -4px 20px rgba(0,0,0,0.08); }
-  .nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; cursor: pointer; font-size: 10px; font-weight: 600; color: var(--muted); transition: color 0.2s; border: none; background: none; padding: 4px 0; }
-  .nav-item.active { color: var(--primary); }
-  .nav-icon { font-size: 22px; line-height: 1; }
-
-  /* TABS */
-  .screen { display: none; animation: fadeIn 0.2s ease; }
-  .screen.active { display: block; }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
-
-  /* CARDS */
-  .card { background: var(--card); border-radius: 16px; padding: 16px; margin: 12px 12px 0; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }
-  .card + .card { margin-top: 10px; }
-  .section-header { padding: 16px 16px 8px; display: flex; justify-content: space-between; align-items: center; }
-  .section-title { font-size: 16px; font-weight: 700; }
-  .badge { background: var(--primary); color: white; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 20px; }
-
-  /* FEED */
-  .post-card { background: var(--card); border-radius: 16px; margin: 12px 12px 0; overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }
-  .post-header { display: flex; align-items: center; gap: 10px; padding: 14px 14px 10px; }
-  .post-avatar { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg, var(--primary), #FF8E53); display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: white; flex-shrink: 0; overflow: hidden; }
-  .post-avatar img { width: 100%; height: 100%; object-fit: cover; }
-  .post-author { font-size: 15px; font-weight: 700; }
-  .post-time { font-size: 12px; color: var(--muted); }
-  .post-content { padding: 0 14px 10px; font-size: 15px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
-  .post-image { width: 100%; max-height: 400px; object-fit: cover; }
-  .post-actions { display: flex; gap: 16px; padding: 10px 14px 14px; border-top: 1px solid var(--border); }
-  .post-action { display: flex; align-items: center; gap: 5px; font-size: 13px; font-weight: 600; color: var(--muted); cursor: pointer; background: none; border: none; }
-  .post-action.liked { color: var(--primary); }
-  .post-action:hover { color: var(--primary); }
-  .post-comments { padding: 0 14px 14px; border-top: 1px solid var(--border); }
-  .comment { display: flex; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
-  .comment:last-child { border-bottom: none; }
-  .comment-author { font-weight: 700; color: var(--primary); flex-shrink: 0; }
-  .comment-input-row { display: flex; gap: 8px; padding-top: 8px; }
-  .comment-input-row input { flex: 1; padding: 8px 12px; border: 2px solid var(--border); border-radius: 20px; font-size: 14px; outline: none; font-family: inherit; }
-  .comment-input-row input:focus { border-color: var(--primary); }
-  .comment-send { background: var(--primary); color: white; border: none; border-radius: 50%; width: 36px; height: 36px; font-size: 16px; cursor: pointer; flex-shrink: 0; }
-
-  /* COMPOSE */
-  .compose-bar { background: white; border-top: 1px solid var(--border); padding: 12px; display: flex; gap: 10px; align-items: center; margin: 12px 12px 0; border-radius: 16px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); cursor: pointer; }
-  .compose-avatar { width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, var(--primary), #FF8E53); display: flex; align-items: center; justify-content: center; font-size: 16px; color: white; flex-shrink: 0; }
-  .compose-placeholder { color: var(--muted); font-size: 15px; }
-
-  /* MODAL */
-  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 100; display: none; align-items: flex-end; }
-  .modal-overlay.open { display: flex; }
-  .modal { background: white; border-radius: 24px 24px 0 0; padding: 24px; width: 100%; max-height: 90vh; overflow-y: auto; animation: slideUp 0.3s ease; }
-  @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
-  .modal-handle { width: 40px; height: 4px; background: var(--border); border-radius: 2px; margin: 0 auto 16px; }
-  .modal-title { font-size: 18px; font-weight: 800; margin-bottom: 16px; }
-  .modal-close { position: absolute; right: 20px; top: 20px; background: var(--border); border: none; border-radius: 50%; width: 32px; height: 32px; font-size: 18px; cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--muted); }
-
-  /* CHATS */
-  .chat-item { display: flex; align-items: center; gap: 12px; padding: 14px 16px; cursor: pointer; border-bottom: 1px solid var(--border); transition: background 0.15s; }
-  .chat-item:hover { background: var(--bg); }
-  .chat-icon { width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg, #A29BFE, #6C5CE7); display: flex; align-items: center; justify-content: center; font-size: 22px; flex-shrink: 0; }
-  .chat-icon.dm { background: linear-gradient(135deg, #74B9FF, #0984E3); }
-  .chat-name { font-size: 15px; font-weight: 700; }
-  .chat-preview { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
-  .chat-time { font-size: 12px; color: var(--muted); margin-left: auto; }
-
-  /* CHAT VIEW */
-  .chat-view { display: none; position: fixed; inset: 0; background: var(--bg); z-index: 50; flex-direction: column; max-width: 480px; left: 50%; transform: translateX(-50%); }
-  .chat-view.open { display: flex; }
-  .chat-header { background: var(--primary); color: white; padding: 16px; display: flex; align-items: center; gap: 12px; }
-  .back-btn { background: none; border: none; color: white; font-size: 22px; cursor: pointer; line-height: 1; }
-  .chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
-  .msg { max-width: 75%; padding: 10px 14px; border-radius: 18px; font-size: 14px; line-height: 1.4; word-break: break-word; }
-  .msg.mine { background: var(--primary); color: white; align-self: flex-end; border-bottom-right-radius: 4px; }
-  .msg.theirs { background: white; color: var(--text); align-self: flex-start; border-bottom-left-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
-  .msg-author { font-size: 11px; font-weight: 700; margin-bottom: 2px; opacity: 0.7; }
-  .msg-time { font-size: 10px; margin-top: 2px; opacity: 0.65; text-align: right; }
-  .chat-input-bar { padding: 12px; background: white; border-top: 1px solid var(--border); display: flex; gap: 10px; align-items: flex-end; padding-bottom: max(12px, env(safe-area-inset-bottom, 12px)); }
-  .chat-input { flex: 1; padding: 10px 14px; border: 2px solid var(--border); border-radius: 20px; font-size: 15px; outline: none; resize: none; max-height: 100px; font-family: inherit; line-height: 1.4; }
-  .chat-input:focus { border-color: var(--primary); }
-  .send-btn { background: var(--primary); color: white; border: none; border-radius: 50%; width: 40px; height: 40px; font-size: 18px; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
-
-  /* BIRTHDAYS */
-  .birthday-item { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
-  .birthday-item:last-child { border-bottom: none; }
-  .birthday-avatar { width: 44px; height: 44px; border-radius: 50%; background: linear-gradient(135deg, var(--primary), #FF8E53); display: flex; align-items: center; justify-content: center; font-size: 20px; color: white; font-weight: 700; flex-shrink: 0; }
-  .birthday-name { font-size: 15px; font-weight: 700; }
-  .birthday-date { font-size: 13px; color: var(--muted); }
-  .birthday-days { margin-left: auto; text-align: right; }
-  .days-number { font-size: 20px; font-weight: 800; color: var(--primary); }
-  .days-label { font-size: 11px; color: var(--muted); }
-  .days-today { font-size: 24px; }
-
-  /* WISHLISTS */
-  .gift-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
-  .gift-item:last-child { border-bottom: none; }
-  .gift-claimed { opacity: 0.5; text-decoration: line-through; }
-  .gift-title { font-size: 14px; font-weight: 600; }
-  .gift-meta { font-size: 12px; color: var(--muted); }
-
-  /* KK */
-  .kk-card { background: linear-gradient(135deg, #2D3436, #636E72); color: white; border-radius: 20px; padding: 20px; margin: 12px; text-align: center; }
-  .kk-year { font-size: 13px; font-weight: 600; opacity: 0.7; margin-bottom: 4px; }
-  .kk-receiver { font-size: 32px; font-weight: 900; margin: 8px 0; }
-  .kk-budget { font-size: 14px; opacity: 0.8; }
-
-  /* EXPENSES */
-  .expense-item { padding: 12px 0; border-bottom: 1px solid var(--border); }
-  .expense-item:last-child { border-bottom: none; }
-  .expense-desc { font-size: 15px; font-weight: 600; }
-  .expense-meta { font-size: 13px; color: var(--muted); margin-top: 2px; }
-  .expense-amount { font-size: 18px; font-weight: 800; color: var(--primary); }
-  .expense-owe { font-size: 12px; color: #e17055; font-weight: 600; }
-  .expense-settled { font-size: 12px; color: #00b894; font-weight: 600; }
-
-  /* PEOPLE PICKER */
-  .person-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 20px; border: 2px solid var(--border); cursor: pointer; font-size: 13px; font-weight: 600; margin: 4px; transition: all 0.15s; }
-  .person-chip.selected { background: var(--primary); color: white; border-color: var(--primary); }
-
-  /* EMPTY STATES */
-  .empty { text-align: center; padding: 48px 24px; color: var(--muted); }
-  .empty-icon { font-size: 48px; margin-bottom: 12px; }
-  .empty-text { font-size: 16px; font-weight: 600; }
-  .empty-sub { font-size: 14px; margin-top: 4px; }
-
-  /* FAB */
-  .fab { position: fixed; bottom: calc(var(--nav-height) + var(--safe-bottom) + 16px); right: max(16px, calc(50vw - 240px + 16px)); background: var(--primary); color: white; border: none; border-radius: 50%; width: 56px; height: 56px; font-size: 24px; cursor: pointer; box-shadow: 0 4px 20px rgba(255,107,107,0.5); z-index: 20; display: none; align-items: center; justify-content: center; }
-  .fab.visible { display: flex; }
-
-  /* TOAST */
-  .toast { position: fixed; top: 80px; left: 50%; transform: translateX(-50%); background: #2D2D2D; color: white; padding: 10px 20px; border-radius: 20px; font-size: 14px; font-weight: 600; z-index: 200; opacity: 0; transition: opacity 0.3s; pointer-events: none; white-space: nowrap; }
-  .toast.show { opacity: 1; }
-
-  /* PROFILE PILL */
-  .profile-row { display: flex; align-items: center; gap: 12px; padding: 16px; background: white; border-radius: 16px; margin: 12px 12px 0; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }
-  .profile-big-avatar { width: 56px; height: 56px; border-radius: 50%; background: linear-gradient(135deg, var(--primary), #FF8E53); display: flex; align-items: center; justify-content: center; font-size: 26px; color: white; font-weight: 700; flex-shrink: 0; overflow: hidden; }
-  .profile-big-avatar img { width: 100%; height: 100%; object-fit: cover; }
-  .profile-name { font-size: 17px; font-weight: 800; }
-  .profile-rel { font-size: 13px; color: var(--muted); }
-
-  /* LOADING */
-  .loading { display: flex; align-items: center; justify-content: center; padding: 32px; color: var(--muted); font-size: 14px; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .spinner { width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: spin 0.7s linear infinite; margin-right: 10px; }
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#f1f5f9;min-height:100vh}
+:root{--primary:#6366f1;--primary-dark:#4f46e5;--surface:#1e293b;--surface2:#334155;--border:#334155;--text:#f1f5f9;--muted:#94a3b8;--danger:#ef4444;--success:#22c55e;--warning:#f59e0b}
+.app{max-width:480px;margin:0 auto;min-height:100vh;display:flex;flex-direction:column;position:relative}
+/* NAV */
+.bottom-nav{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:480px;background:var(--surface);border-top:1px solid var(--border);display:flex;z-index:100;padding-bottom:env(safe-area-inset-bottom)}
+.nav-item{flex:1;display:flex;flex-direction:column;align-items:center;padding:8px 0;cursor:pointer;color:var(--muted);font-size:10px;gap:2px;transition:color .2s;position:relative}
+.nav-item.active{color:var(--primary)}
+.nav-item svg{width:22px;height:22px}
+.nav-badge{position:absolute;top:4px;right:calc(50% - 18px);background:var(--danger);color:#fff;font-size:9px;border-radius:99px;padding:1px 4px;min-width:16px;text-align:center}
+/* HEADER */
+.header{position:sticky;top:0;background:var(--surface);z-index:50;padding:12px 16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--border)}
+.header h1{font-size:18px;font-weight:700;flex:1}
+.header-actions{display:flex;gap:8px}
+/* SCREENS */
+.screen{display:none;flex:1;flex-direction:column;padding-bottom:70px}
+.screen.active{display:flex}
+/* CARDS */
+.card{background:var(--surface);border-radius:16px;padding:16px;margin:0 12px 12px}
+.card-header{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+/* AVATAR */
+.avatar{width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;flex-shrink:0;overflow:hidden}
+.avatar img{width:100%;height:100%;object-fit:cover}
+.avatar-sm{width:30px;height:30px;font-size:12px}
+.avatar-lg{width:56px;height:56px;font-size:22px}
+/* BUTTONS */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:10px 18px;border-radius:12px;border:none;font-size:14px;font-weight:600;cursor:pointer;transition:all .15s}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover{background:var(--primary-dark)}
+.btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border)}
+.btn-danger{background:var(--danger);color:#fff}
+.btn-sm{padding:6px 12px;font-size:13px}
+.btn-full{width:100%;justify-content:center}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+/* INPUTS */
+.input-group{margin-bottom:14px}
+.input-group label{display:block;font-size:13px;color:var(--muted);margin-bottom:4px}
+input,textarea,select{width:100%;padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:15px;font-family:inherit;outline:none;transition:border-color .15s}
+input:focus,textarea:focus,select:focus{border-color:var(--primary)}
+textarea{resize:vertical;min-height:80px}
+/* MODAL */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:flex;align-items:flex-end;justify-content:center;opacity:0;pointer-events:none;transition:opacity .25s}
+.modal-overlay.open{opacity:1;pointer-events:all}
+.modal{background:var(--surface);border-radius:24px 24px 0 0;width:100%;max-width:480px;padding:20px 16px;max-height:90vh;overflow-y:auto;transform:translateY(100%);transition:transform .3s cubic-bezier(.32,.72,0,1)}
+.modal-overlay.open .modal{transform:translateY(0)}
+.modal-handle{width:40px;height:4px;background:var(--border);border-radius:2px;margin:0 auto 16px}
+.modal h2{font-size:18px;font-weight:700;margin-bottom:16px}
+/* CHAT */
+.chat-list .chat-item{display:flex;align-items:center;gap:12px;padding:12px 16px;cursor:pointer;transition:background .15s;border-bottom:1px solid var(--border)}
+.chat-item:hover{background:var(--surface2)}
+.chat-meta{flex:1;min-width:0}
+.chat-meta h3{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chat-meta p{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chat-time{font-size:11px;color:var(--muted)}
+/* MESSAGES */
+.msg-bubble{max-width:75%;padding:10px 14px;border-radius:18px;font-size:15px;line-height:1.4;word-break:break-word}
+.msg-bubble.mine{background:var(--primary);color:#fff;border-bottom-right-radius:4px;align-self:flex-end}
+.msg-bubble.theirs{background:var(--surface2);border-bottom-left-radius:4px;align-self:flex-start}
+.msg-row{display:flex;flex-direction:column;margin-bottom:4px;padding:0 12px}
+.msg-sender{font-size:11px;color:var(--muted);margin-bottom:2px}
+.msg-reactions{display:flex;gap:4px;margin-top:4px;flex-wrap:wrap}
+.reaction-pill{background:var(--surface2);border-radius:99px;padding:2px 8px;font-size:12px;cursor:pointer;border:1px solid transparent}
+.reaction-pill:hover{border-color:var(--primary)}
+/* STORIES */
+.stories-strip{display:flex;gap:10px;overflow-x:auto;padding:12px 16px;scrollbar-width:none}
+.stories-strip::-webkit-scrollbar{display:none}
+.story-item{display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer;flex-shrink:0}
+.story-ring{width:58px;height:58px;border-radius:50%;padding:2px;background:linear-gradient(45deg,#f09433,#e6683c,#dc2743,#cc2366,#bc1888);position:relative}
+.story-ring.seen{background:var(--border)}
+.story-ring .avatar{width:100%;height:100%;border:2px solid var(--surface)}
+.story-item span{font-size:11px;color:var(--muted);max-width:60px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* FEED POST */
+.post-card{background:var(--surface);margin:0 0 8px;border-bottom:1px solid var(--border)}
+.post-header{display:flex;align-items:center;gap:10px;padding:12px 16px 8px}
+.post-content{padding:0 16px;font-size:15px;line-height:1.5;margin-bottom:10px}
+.post-media{display:grid;gap:2px;margin-bottom:10px}
+.post-media.count-1 img{width:100%;max-height:400px;object-fit:cover}
+.post-media.count-2{grid-template-columns:1fr 1fr}
+.post-media img{width:100%;height:180px;object-fit:cover;cursor:pointer}
+.post-actions{display:flex;gap:0;border-top:1px solid var(--border);padding:4px 8px}
+.post-action{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;padding:8px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--muted);transition:all .15s}
+.post-action:hover{background:var(--surface2);color:var(--text)}
+.post-action.liked{color:#ef4444}
+/* PILLS / TABS */
+.tabs{display:flex;gap:6px;padding:12px 16px 0;overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{padding:6px 14px;border-radius:99px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;border:1px solid var(--border);color:var(--muted);transition:all .15s}
+.tab.active{background:var(--primary);color:#fff;border-color:var(--primary)}
+/* EXPENSE / TRANSFER */
+.amount-badge{font-weight:700;font-size:15px}
+.amount-badge.positive{color:var(--success)}
+.amount-badge.negative{color:var(--danger)}
+/* UTILITIES */
+.flex{display:flex}.flex-col{flex-direction:column}.items-center{align-items:center}.justify-between{justify-content:space-between}.gap-2{gap:8px}.gap-3{gap:12px}.mt-2{margin-top:8px}.mt-3{margin-top:12px}.text-muted{color:var(--muted)}.text-sm{font-size:13px}.text-xs{font-size:11px}.font-bold{font-weight:700}.p-4{padding:16px}.px-4{padding-left:16px;padding-right:16px}.py-2{padding-top:8px;padding-bottom:8px}.rounded-lg{border-radius:12px}.w-full{width:100%}
+.empty-state{display:flex;flex-direction:column;align-items:center;gap:12px;padding:48px 16px;color:var(--muted);text-align:center}
+.empty-state .icon{font-size:48px}
+.spinner{width:24px;height:24px;border:3px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite;margin:32px auto}
+@keyframes spin{to{transform:rotate(360deg)}}
+.toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#1e293b;color:#f1f5f9;padding:10px 20px;border-radius:12px;font-size:14px;z-index:500;box-shadow:0 4px 20px rgba(0,0,0,.4);opacity:0;transition:opacity .3s;pointer-events:none}
+.toast.show{opacity:1}
+/* AUTH */
+.auth-screen{position:fixed;inset:0;background:#0f172a;z-index:300;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px}
+.auth-screen h1{font-size:32px;font-weight:800;margin-bottom:6px}
+.auth-screen p{color:var(--muted);margin-bottom:32px;text-align:center}
+.auth-card{background:var(--surface);border-radius:20px;padding:24px;width:100%;max-width:380px}
+.auth-tabs{display:flex;background:var(--surface2);border-radius:10px;padding:3px;margin-bottom:20px}
+.auth-tab{flex:1;text-align:center;padding:6px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;color:var(--muted);transition:all .2s}
+.auth-tab.active{background:var(--primary);color:#fff}
+/* CHAT SCREEN */
+.chat-screen{position:fixed;inset:0;background:#0f172a;z-index:200;display:flex;flex-direction:column;transform:translateX(100%);transition:transform .3s cubic-bezier(.32,.72,0,1)}
+.chat-screen.open{transform:translateX(0)}
+.chat-messages{flex:1;overflow-y:auto;padding:12px 0;display:flex;flex-direction:column}
+.chat-input-bar{padding:8px 12px;background:var(--surface);border-top:1px solid var(--border);display:flex;gap:8px;align-items:flex-end;padding-bottom:calc(8px + env(safe-area-inset-bottom))}
+.chat-input-bar textarea{flex:1;min-height:38px;max-height:120px;border-radius:20px;padding:8px 14px;font-size:15px;resize:none;line-height:1.4}
+.send-btn{width:40px;height:40px;border-radius:50%;background:var(--primary);border:none;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+/* STORY VIEWER */
+.story-viewer{position:fixed;inset:0;background:#000;z-index:400;display:flex;flex-direction:column}
+.story-progress{display:flex;gap:3px;padding:12px}
+.story-progress .bar{flex:1;height:3px;background:rgba(255,255,255,.3);border-radius:2px}
+.story-progress .bar.done{background:#fff}
+.story-progress .bar.active{background:#fff;animation:progress-fill linear forwards}
+@keyframes progress-fill{from{transform-origin:left;transform:scaleX(0)}to{transform-origin:left;transform:scaleX(1)}}
+.story-content{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;text-align:center;font-size:20px;font-weight:600;word-break:break-word}
+/* EVENTS */
+.event-card{background:var(--surface);border-radius:14px;padding:14px;margin:0 12px 10px;border-left:4px solid var(--primary)}
+.event-date{font-size:12px;color:var(--primary);font-weight:700;text-transform:uppercase;margin-bottom:4px}
+/* TRANSFERS */
+.transfer-item{display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border)}
+/* VAULT */
+.doc-item{display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border);cursor:pointer}
+.doc-icon{width:40px;height:40px;border-radius:10px;background:var(--primary);display:flex;align-items:center;justify-content:center;font-size:20px}
+/* EXPENSE */
+.expense-item{padding:14px 16px;border-bottom:1px solid var(--border)}
 </style>
 </head>
 <body>
-<div id="app">
-
-  <!-- AUTH SCREEN -->
+<div class="app" id="app">
+  <!-- AUTH -->
   <div class="auth-screen" id="authScreen">
-    <div class="auth-logo">🏠</div>
-    <div class="auth-title">Family Hub</div>
-    <div class="auth-sub">Your family's private little corner of the internet</div>
+    <div style="font-size:52px;margin-bottom:8px">🏠</div>
+    <h1>Family Hub</h1>
+    <p>Your private family space</p>
     <div class="auth-card">
       <div class="auth-tabs">
-        <button class="auth-tab active" id="loginTab" onclick="showAuthTab('login')">Log In</button>
-        <button class="auth-tab" id="inviteTab" onclick="showAuthTab('invite')">Join with Link</button>
+        <div class="auth-tab active" onclick="switchAuthTab('login')">Log In</div>
+        <div class="auth-tab" onclick="switchAuthTab('invite')">Join</div>
       </div>
-
-      <!-- LOGIN FORM -->
       <div id="loginForm">
-        <div class="form-group"><label>Your Name</label><input type="text" id="loginName" placeholder="e.g. Mona" autocomplete="username"></div>
-        <div class="form-group"><label>Password</label><input type="password" id="loginPass" placeholder="Your password" autocomplete="current-password"></div>
-        <button class="btn" onclick="doLogin()">Log In 👋</button>
-        <div id="loginError" class="error-msg" style="display:none"></div>
+        <div class="input-group"><label>Name</label><input type="text" id="loginName" placeholder="Your name"></div>
+        <div class="input-group"><label>Password</label><input type="password" id="loginPass" placeholder="Password"></div>
+        <button class="btn btn-primary btn-full" onclick="doLogin()">Log In</button>
       </div>
-
-      <!-- INVITE FORM -->
       <div id="inviteForm" style="display:none">
-        <div class="form-group"><label>Invite Token</label><input type="text" id="inviteToken" placeholder="Paste your invite token"></div>
-        <div class="form-group"><label>Your Name (or keep as-is)</label><input type="text" id="inviteName" placeholder="Your name"></div>
-        <div class="form-group"><label>Choose a Password</label><input type="password" id="invitePass" placeholder="Choose a password" autocomplete="new-password"></div>
-        <button class="btn" onclick="doRedeem()">Join Family Hub 🎉</button>
-        <div id="inviteError" class="error-msg" style="display:none"></div>
+        <div class="input-group"><label>Invite Code</label><input type="text" id="inviteCode" placeholder="Paste your invite link or code"></div>
+        <div id="inviteNameRow" style="display:none">
+          <div class="input-group"><label>Your Name</label><input type="text" id="inviteName"></div>
+          <div class="input-group"><label>Choose Password</label><input type="password" id="invitePass" placeholder="Min 6 characters"></div>
+        </div>
+        <button class="btn btn-primary btn-full" onclick="doInviteNext()" id="inviteBtn">Check Code</button>
       </div>
     </div>
   </div>
 
   <!-- MAIN APP -->
-  <div class="main-app" id="mainApp">
-    <div class="header">
-      <div>
-        <div class="header-title" id="headerTitle">Family Hub 🏠</div>
-        <div class="header-sub" id="headerSub">Everyone's here</div>
-      </div>
-      <div class="header-avatar" onclick="showProfile()" id="headerAvatar">👤</div>
+  <div id="mainApp" style="display:none;flex:1;flex-direction:column">
+    <!-- Stories strip (shown above feed) -->
+    <div id="storiesWrap" style="background:var(--surface);border-bottom:1px solid var(--border);display:none">
+      <div class="stories-strip" id="storiesStrip"></div>
     </div>
 
-    <div class="content" id="mainContent">
-
-      <!-- FEED TAB -->
-      <div class="screen active" id="screenFeed">
-        <div class="compose-bar" onclick="openModal('composeModal')">
-          <div class="compose-avatar" id="composeAvatar">✨</div>
-          <div class="compose-placeholder">What's happening in the family?</div>
+    <!-- FEED -->
+    <div class="screen active" id="screenFeed">
+      <div class="header">
+        <div style="font-size:22px">🏠</div>
+        <h1>Family Hub</h1>
+        <div class="header-actions">
+          <button class="btn btn-sm btn-ghost" onclick="openModal('newPostModal')">+ Post</button>
         </div>
-        <div id="feedList"><div class="loading"><div class="spinner"></div>Loading...</div></div>
       </div>
+      <div id="feedList" style="flex:1;overflow-y:auto"></div>
+    </div>
 
-      <!-- CHATS TAB -->
-      <div class="screen" id="screenChats">
-        <div id="chatList"><div class="loading"><div class="spinner"></div>Loading...</div></div>
+    <!-- CHATS -->
+    <div class="screen" id="screenChats">
+      <div class="header">
+        <h1>💬 Chats</h1>
+        <button class="btn btn-sm btn-ghost" onclick="openModal('newChatModal')">+ New</button>
       </div>
+      <div class="chat-list" id="chatList" style="flex:1;overflow-y:auto"></div>
+    </div>
 
-      <!-- BIRTHDAYS TAB -->
-      <div class="screen" id="screenBirthdays">
-        <div class="card" id="birthdayList"><div class="loading"><div class="spinner"></div>Loading...</div></div>
-        <div class="section-header"><span class="section-title">🎁 Wish Lists</span></div>
-        <div class="card" style="padding:0" id="wishlistPicker">
-          <div style="padding:14px 16px; border-bottom:1px solid var(--border)">
-            <select class="form-group" id="wishlistUser" onchange="loadGifts(this.value)" style="width:100%;padding:8px 12px;border:none;font-size:14px;font-weight:600;outline:none;background:none">
-              <option value="">— pick a family member —</option>
-            </select>
-          </div>
-          <div id="giftList" style="padding:0 16px"></div>
-        </div>
-        <div id="myWishlistSection" style="margin-top:0"></div>
+    <!-- EVENTS -->
+    <div class="screen" id="screenEvents">
+      <div class="header">
+        <h1>📅 Events</h1>
+        <button class="btn btn-sm btn-ghost" onclick="openModal('newEventModal')">+ Add</button>
       </div>
+      <div id="eventsList" style="flex:1;overflow-y:auto;padding:12px 0"></div>
+    </div>
 
-      <!-- KK TAB -->
-      <div class="screen" id="screenKK">
-        <div id="kkContent"><div class="loading"><div class="spinner"></div>Loading...</div></div>
+    <!-- MORE (Birthdays, Gifts, KK, Expenses, Transfers, Vault) -->
+    <div class="screen" id="screenMore">
+      <div class="header"><h1>⋯ More</h1></div>
+      <div class="tabs" id="moreTabs">
+        <div class="tab active" onclick="switchMoreTab('birthdays')">🎂 Birthdays</div>
+        <div class="tab" onclick="switchMoreTab('gifts')">🎁 Gifts</div>
+        <div class="tab" onclick="switchMoreTab('kk')">🎅 KK Draw</div>
+        <div class="tab" onclick="switchMoreTab('expenses')">💸 Expenses</div>
+        <div class="tab" onclick="switchMoreTab('transfers')">💳 Transfers</div>
+        <div class="tab" onclick="switchMoreTab('vault')">🔐 Vault</div>
       </div>
+      <div id="moreContent" style="flex:1;overflow-y:auto;padding:12px 0"></div>
+    </div>
 
-      <!-- EXPENSES TAB -->
-      <div class="screen" id="screenExpenses">
-        <div class="card" id="expenseList"><div class="loading"><div class="spinner"></div>Loading...</div></div>
-      </div>
-
+    <!-- PROFILE -->
+    <div class="screen" id="screenProfile">
+      <div class="header"><h1>👤 Profile</h1></div>
+      <div id="profileContent" style="padding:16px"></div>
     </div>
 
     <!-- BOTTOM NAV -->
     <nav class="bottom-nav">
-      <button class="nav-item active" id="navFeed" onclick="switchTab('Feed')"><span class="nav-icon">🏠</span>Feed</button>
-      <button class="nav-item" id="navChats" onclick="switchTab('Chats')"><span class="nav-icon">💬</span>Chats</button>
-      <button class="nav-item" id="navBirthdays" onclick="switchTab('Birthdays')"><span class="nav-icon">🎂</span>Birthdays</button>
-      <button class="nav-item" id="navKK" onclick="switchTab('KK')"><span class="nav-icon">🎅</span>KK</button>
-      <button class="nav-item" id="navExpenses" onclick="switchTab('Expenses')"><span class="nav-icon">💸</span>Expenses</button>
+      <div class="nav-item active" onclick="switchScreen('Feed')" id="navFeed">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        Feed
+      </div>
+      <div class="nav-item" onclick="switchScreen('Chats')" id="navChats">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        Chats
+        <span class="nav-badge" id="chatBadge" style="display:none">0</span>
+      </div>
+      <div class="nav-item" onclick="switchScreen('Events')" id="navEvents">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+        Events
+      </div>
+      <div class="nav-item" onclick="switchScreen('More')" id="navMore">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
+        More
+      </div>
+      <div class="nav-item" onclick="switchScreen('Profile')" id="navProfile">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        Me
+        <span class="nav-badge" id="notifBadge" style="display:none">0</span>
+      </div>
     </nav>
-
-    <!-- FAB -->
-    <button class="fab" id="fab" onclick="onFabClick()">+</button>
   </div>
 
-  <!-- TOAST -->
-  <div class="toast" id="toast"></div>
-
-  <!-- CHAT VIEW (full screen overlay) -->
-  <div class="chat-view" id="chatView">
-    <div class="chat-header">
-      <button class="back-btn" onclick="closeChat()">←</button>
-      <div>
-        <div style="font-weight:800;font-size:16px" id="chatViewName">Chat</div>
-        <div style="font-size:12px;opacity:0.8" id="chatViewType">Group</div>
+  <!-- CHAT SCREEN -->
+  <div class="chat-screen" id="chatScreen">
+    <div class="header">
+      <button class="btn btn-ghost btn-sm" onclick="closeChat()" style="padding:6px 10px">←</button>
+      <div style="flex:1">
+        <div id="chatScreenName" style="font-weight:700;font-size:16px"></div>
+        <div id="chatScreenMembers" style="font-size:12px;color:var(--muted)"></div>
       </div>
     </div>
     <div class="chat-messages" id="chatMessages"></div>
     <div class="chat-input-bar">
-      <textarea class="chat-input" id="chatInputField" placeholder="Message..." rows="1"
-        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"
-        oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
-      <button class="send-btn" onclick="sendMessage()">→</button>
+      <label style="cursor:pointer;color:var(--muted)">
+        📎
+        <input type="file" id="chatFileInput" style="display:none" accept="image/*,video/*,application/pdf" onchange="sendChatFile()">
+      </label>
+      <textarea id="chatMsgInput" placeholder="Message..." onkeydown="handleMsgKey(event)" rows="1"></textarea>
+      <button class="send-btn" onclick="sendMsg()">
+        <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+      </button>
     </div>
+  </div>
+
+  <!-- STORY VIEWER -->
+  <div class="story-viewer" id="storyViewer" style="display:none">
+    <div style="display:flex;align-items:center;gap:10px;padding:12px 16px">
+      <div class="story-progress" id="storyProgressBars" style="flex:1"></div>
+      <button onclick="closeStoryViewer()" style="background:none;border:none;color:#fff;font-size:22px;cursor:pointer">×</button>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;padding:0 16px 12px">
+      <div class="avatar avatar-sm" id="storyViewerAvatar"></div>
+      <span id="storyViewerName" style="font-weight:600;color:#fff"></span>
+      <span id="storyViewerTime" style="font-size:12px;color:rgba(255,255,255,.6);margin-left:auto"></span>
+    </div>
+    <div class="story-content" id="storyViewerContent"></div>
+    <div style="padding:20px;text-align:center;color:rgba(255,255,255,.4);font-size:13px" id="storyViewerViews"></div>
   </div>
 
   <!-- MODALS -->
-  <!-- Compose Post -->
-  <div class="modal-overlay" id="composeModal" onclick="if(event.target===this)closeModal('composeModal')">
+  <div class="modal-overlay" id="newPostModal" onclick="handleOverlayClick(event,'newPostModal')">
     <div class="modal">
       <div class="modal-handle"></div>
-      <div class="modal-title">✍️ New Post</div>
-      <button class="modal-close" onclick="closeModal('composeModal')">×</button>
-      <div class="form-group"><textarea id="postContent" placeholder="What's happening? 👶📸🎉" rows="4" style="resize:none"></textarea></div>
-      <div class="form-group"><label>Photo URL (optional)</label><input type="url" id="postImageUrl" placeholder="https://..."></div>
-      <div class="form-group"><label>Post type</label>
-        <select id="postType"><option value="post">📝 General</option><option value="photo">📸 Photo / Baby spam</option><option value="milestone">🎉 Milestone</option><option value="holiday">✈️ Holiday</option></select>
+      <h2>New Post</h2>
+      <textarea id="postContent" placeholder="What's happening in the family?" style="margin-bottom:12px"></textarea>
+      <div style="margin-bottom:12px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--muted);font-size:14px">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21,15 16,10 5,21"/></svg>
+          Add photos
+          <input type="file" id="postMediaInput" multiple accept="image/*,video/*" style="display:none" onchange="previewPostMedia()">
+        </label>
+        <div id="postMediaPreview" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"></div>
       </div>
-      <button class="btn" onclick="submitPost()">Post it! 🚀</button>
+      <button class="btn btn-primary btn-full" onclick="submitPost()">Post</button>
     </div>
   </div>
 
-  <!-- New Chat -->
-  <div class="modal-overlay" id="newChatModal" onclick="if(event.target===this)closeModal('newChatModal')">
+  <div class="modal-overlay" id="newChatModal" onclick="handleOverlayClick(event,'newChatModal')">
     <div class="modal">
       <div class="modal-handle"></div>
-      <div class="modal-title">💬 New Chat</div>
-      <button class="modal-close" onclick="closeModal('newChatModal')">×</button>
-      <div class="form-group"><label>Chat Name</label><input type="text" id="newChatName" placeholder="e.g. Sisters ❤️"></div>
-      <div class="form-group"><label>Type</label>
-        <select id="newChatType"><option value="group">👨‍👩‍👧 Group</option><option value="direct">👤 Private (1:1)</option></select>
-      </div>
-      <div class="form-group"><label>Add Family Members</label>
-        <div id="chatMemberPicker"></div>
-      </div>
-      <button class="btn" onclick="createChat()">Start Chat 💬</button>
+      <h2>New Chat</h2>
+      <div class="input-group"><label>Name (optional)</label><input type="text" id="newChatName" placeholder="Group name..."></div>
+      <div class="input-group"><label>Members</label><div id="userCheckboxes" style="display:flex;flex-direction:column;gap:8px;max-height:200px;overflow-y:auto"></div></div>
+      <button class="btn btn-primary btn-full mt-3" onclick="createChat()">Start Chat</button>
     </div>
   </div>
 
-  <!-- Add Gift -->
-  <div class="modal-overlay" id="addGiftModal" onclick="if(event.target===this)closeModal('addGiftModal')">
+  <div class="modal-overlay" id="newEventModal" onclick="handleOverlayClick(event,'newEventModal')">
     <div class="modal">
       <div class="modal-handle"></div>
-      <div class="modal-title">🎁 Add to Wish List</div>
-      <button class="modal-close" onclick="closeModal('addGiftModal')">×</button>
-      <div class="form-group"><label>What do you want?</label><input type="text" id="giftTitle" placeholder="e.g. Cozy jumper, size M"></div>
-      <div class="form-group"><label>Notes (optional)</label><input type="text" id="giftDesc" placeholder="Colour, brand, anything helpful"></div>
-      <div class="form-group"><label>Link (optional)</label><input type="url" id="giftUrl" placeholder="https://..."></div>
-      <div class="form-group"><label>Price (€ approx)</label><input type="number" id="giftPrice" placeholder="30"></div>
-      <div class="form-group"><label>For</label>
-        <select id="giftEvent"><option value="birthday">🎂 Birthday</option><option value="christmas">🎄 Christmas</option><option value="general">🎁 General</option></select>
-      </div>
-      <button class="btn" onclick="submitGift()">Add to List 🎁</button>
+      <h2>New Event</h2>
+      <div class="input-group"><label>Title</label><input type="text" id="eventTitle" placeholder="Family BBQ..."></div>
+      <div class="input-group"><label>When</label><input type="datetime-local" id="eventStart"></div>
+      <div class="input-group"><label>Location</label><input type="text" id="eventLocation" placeholder="Address or link..."></div>
+      <div class="input-group"><label>Notes</label><textarea id="eventDesc" placeholder="Details..."></textarea></div>
+      <button class="btn btn-primary btn-full" onclick="createEvent()">Add Event</button>
     </div>
   </div>
 
-  <!-- KK Draw -->
-  <div class="modal-overlay" id="kkModal" onclick="if(event.target===this)closeModal('kkModal')">
+  <div class="modal-overlay" id="newTransferModal" onclick="handleOverlayClick(event,'newTransferModal')">
     <div class="modal">
       <div class="modal-handle"></div>
-      <div class="modal-title">🎅 Set Up KK Draw</div>
-      <button class="modal-close" onclick="closeModal('kkModal')">×</button>
-      <div class="form-group"><label>Year</label><input type="number" id="kkYear" value="2026"></div>
-      <div class="form-group"><label>Budget (€)</label><input type="number" id="kkBudget" placeholder="e.g. 50"></div>
-      <button class="btn" onclick="createKKDraw()">Create Draw 🎄</button>
+      <h2>Send Money Request</h2>
+      <div class="input-group"><label>To</label><select id="transferTo"></select></div>
+      <div class="input-group"><label>Amount (€)</label><input type="number" id="transferAmount" placeholder="0.00" step="0.01" min="0.01"></div>
+      <div class="input-group"><label>Note</label><input type="text" id="transferNote" placeholder="e.g. Insurance, Dinner..."></div>
+      <button class="btn btn-primary btn-full" onclick="createTransfer()">Send Request</button>
     </div>
   </div>
 
-  <!-- KK Participants -->
-  <div class="modal-overlay" id="kkDrawModal" onclick="if(event.target===this)closeModal('kkDrawModal')">
+  <div class="modal-overlay" id="newExpenseModal" onclick="handleOverlayClick(event,'newExpenseModal')">
     <div class="modal">
       <div class="modal-handle"></div>
-      <div class="modal-title">🎁 Draw Names</div>
-      <button class="modal-close" onclick="closeModal('kkDrawModal')">×</button>
-      <div class="form-group"><label>Who's in this year's KK?</label>
-        <div id="kkParticipantPicker"></div>
-      </div>
-      <button class="btn" onclick="runKKDraw()">Draw Names! 🎲</button>
+      <h2>Add Expense</h2>
+      <div class="input-group"><label>Description</label><input type="text" id="expDesc" placeholder="Hotel, dinner, gift..."></div>
+      <div class="input-group"><label>Total Amount (€)</label><input type="number" id="expAmount" placeholder="0.00" step="0.01" min="0.01" oninput="updateExpSplits()"></div>
+      <div class="input-group"><label>Split with</label><div id="expSplitUsers" style="display:flex;flex-direction:column;gap:6px;max-height:160px;overflow-y:auto"></div></div>
+      <button class="btn btn-primary btn-full mt-3" onclick="submitExpense()">Add Expense</button>
     </div>
   </div>
 
-  <!-- Add Expense -->
-  <div class="modal-overlay" id="addExpenseModal" onclick="if(event.target===this)closeModal('addExpenseModal')">
+  <div class="modal-overlay" id="newGiftModal" onclick="handleOverlayClick(event,'newGiftModal')">
     <div class="modal">
       <div class="modal-handle"></div>
-      <div class="modal-title">💸 Add Expense</div>
-      <button class="modal-close" onclick="closeModal('addExpenseModal')">×</button>
-      <div class="form-group"><label>What for?</label><input type="text" id="expenseDesc" placeholder="e.g. Car insurance, Mum's birthday dinner"></div>
-      <div class="form-group"><label>Total Amount (€)</label><input type="number" id="expenseAmount" placeholder="100"></div>
-      <div class="form-group"><label>Category</label>
-        <select id="expenseCategory">
-          <option value="presents">🎁 Presents</option>
-          <option value="insurance">🛡️ Insurance</option>
-          <option value="holiday">✈️ Holiday</option>
-          <option value="food">🍽️ Food / Dinner</option>
-          <option value="general">📋 General</option>
+      <h2>Add to Wish List</h2>
+      <div class="input-group"><label>Item</label><input type="text" id="giftTitle" placeholder="AirPods, book..."></div>
+      <div class="input-group"><label>Link (optional)</label><input type="url" id="giftUrl" placeholder="https://..."></div>
+      <div class="input-group"><label>Price (optional)</label><input type="number" id="giftPrice" placeholder="€0"></div>
+      <button class="btn btn-primary btn-full" onclick="addGift()">Add</button>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="uploadDocModal" onclick="handleOverlayClick(event,'uploadDocModal')">
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <h2>Upload Document</h2>
+      <div class="input-group"><label>Name</label><input type="text" id="docName" placeholder="Passport, Insurance..."></div>
+      <div class="input-group"><label>Type</label>
+        <select id="docType">
+          <option value="id">ID / Passport</option>
+          <option value="insurance">Insurance</option>
+          <option value="medical">Medical</option>
+          <option value="finance">Finance</option>
+          <option value="other">Other</option>
         </select>
       </div>
-      <div class="form-group"><label>Split with</label>
-        <div id="expenseSplitPicker"></div>
+      <div class="input-group"><label>File</label><input type="file" id="docFile" accept="*/*"></div>
+      <div class="input-group">
+        <label style="display:flex;gap:8px;align-items:center;cursor:pointer">
+          <input type="checkbox" id="docShared" style="width:auto">
+          Share with family
+        </label>
       </div>
-      <button class="btn" onclick="submitExpense()">Add Expense 💸</button>
+      <button class="btn btn-primary btn-full" onclick="uploadDoc()">Upload (Encrypted)</button>
     </div>
   </div>
 
-</div><!-- #app -->
+  <div class="modal-overlay" id="storyModal" onclick="handleOverlayClick(event,'storyModal')">
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <h2>Add Story</h2>
+      <div id="storyTypeToggle" style="display:flex;gap:8px;margin-bottom:12px">
+        <button class="tab active" onclick="setStoryType('text',this)">Text</button>
+        <button class="tab" onclick="setStoryType('image',this)">Photo</button>
+      </div>
+      <div id="storyTextInput">
+        <textarea id="storyContent" placeholder="Share something with the family... (lasts 24h)"></textarea>
+        <div class="input-group mt-2"><label>Background</label>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px" id="bgPicker">
+            <div style="width:32px;height:32px;border-radius:8px;background:#6366f1;cursor:pointer;border:2px solid white" onclick="selectBg('#6366f1',this)"></div>
+            <div style="width:32px;height:32px;border-radius:8px;background:#ec4899;cursor:pointer" onclick="selectBg('#ec4899',this)"></div>
+            <div style="width:32px;height:32px;border-radius:8px;background:#f59e0b;cursor:pointer" onclick="selectBg('#f59e0b',this)"></div>
+            <div style="width:32px;height:32px;border-radius:8px;background:#22c55e;cursor:pointer" onclick="selectBg('#22c55e',this)"></div>
+            <div style="width:32px;height:32px;border-radius:8px;background:#0ea5e9;cursor:pointer" onclick="selectBg('#0ea5e9',this)"></div>
+            <div style="width:32px;height:32px;border-radius:8px;background:#1e293b;cursor:pointer;border:1px solid #334155" onclick="selectBg('#1e293b',this)"></div>
+          </div>
+        </div>
+      </div>
+      <div id="storyImageInput" style="display:none">
+        <input type="file" id="storyFile" accept="image/*,video/*">
+      </div>
+      <button class="btn btn-primary btn-full mt-3" onclick="postStory()">Share Story</button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+</div>
 
 <script>
-// ── STATE ──────────────────────────────────────────────────────────────────
-let token = localStorage.getItem('fh_token');
-let me = null;
+// ─── STATE ────────────────────────────────────────────────────────────────────
+let session = JSON.parse(localStorage.getItem('fh_session')||'null');
+let currentUser = null;
 let allUsers = [];
-let currentTab = 'Feed';
 let currentChatId = null;
-let currentKKDrawId = null;
-const API = '';
+let currentChatName = '';
+let chatPollInterval = null;
+let lastMsgTime = null;
+let currentMoreTab = 'birthdays';
+let storyBg = '#6366f1';
+let storyType = 'text';
+let currentStories = [];
+let storyIdx = 0;
+let storyTimer = null;
 
-// ── BOOT ───────────────────────────────────────────────────────────────────
-async function boot() {
-  // Check URL for invite token
-  const params = new URLSearchParams(location.search);
-  const inviteParam = params.get('invite');
-  if (inviteParam) {
-    showAuthTab('invite');
-    document.getElementById('inviteToken').value = inviteParam;
-    history.replaceState({}, '', '/');
-  }
+// ─── UTILS ────────────────────────────────────────────────────────────────────
+function api(path, opts={}) {
+  const headers = {'content-type':'application/json'};
+  if (session?.token) headers['x-session-token'] = session.token;
+  if (opts.headers) Object.assign(headers, opts.headers);
+  if (opts.body instanceof FormData) delete headers['content-type'];
+  return fetch(path, {...opts, headers}).then(r => r.json());
+}
+function apiForm(path, formData) {
+  const headers = {};
+  if (session?.token) headers['x-session-token'] = session.token;
+  return fetch(path, {method:'POST', headers, body:formData}).then(r => r.json());
+}
+function toast(msg, dur=2500) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), dur);
+}
+function timeAgo(ts) {
+  if (!ts) return '';
+  const diff = Date.now() - new Date(ts).getTime();
+  if (diff < 60000) return 'just now';
+  if (diff < 3600000) return Math.floor(diff/60000) + 'm ago';
+  if (diff < 86400000) return Math.floor(diff/3600000) + 'h ago';
+  return Math.floor(diff/86400000) + 'd ago';
+}
+function initials(name) { return (name||'?').split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2); }
+function avatarEl(u, size='') {
+  if (u.avatar_url) return \`<div class="avatar \${size}"><img src="\${u.avatar_url}" alt="\${u.name}"></div>\`;
+  return \`<div class="avatar \${size}" style="background:\${u.avatar_color||'#6366f1'}">\${initials(u.name)}</div>\`;
+}
+function openModal(id) { document.getElementById(id).classList.add('open'); }
+function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+function handleOverlayClick(e, id) { if (e.target === e.currentTarget) closeModal(id); }
+function qs(sel) { return document.querySelector(sel); }
 
-  if (token) {
-    try {
-      const res = await api('/api/auth/me');
-      if (res.user) {
-        me = res.user;
-        showApp();
-        return;
-      }
-    } catch {}
-    localStorage.removeItem('fh_token');
-    token = null;
-  }
-  document.getElementById('authScreen').style.display = 'flex';
+// ─── AUTH ──────────────────────────────────────────────────────────────────────
+function switchAuthTab(tab) {
+  document.querySelectorAll('.auth-tab').forEach((t,i) => t.classList.toggle('active', (tab==='login'&&i===0)||(tab==='invite'&&i===1)));
+  qs('#loginForm').style.display = tab==='login'?'block':'none';
+  qs('#inviteForm').style.display = tab==='invite'?'block':'none';
 }
 
-// ── API HELPER ─────────────────────────────────────────────────────────────
-async function api(path, method = 'GET', body = null) {
-  const opts = {
-    method,
-    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }
-  };
-  if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(API + path, opts);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || 'Request failed');
-  return data;
-}
-
-// ── AUTH ───────────────────────────────────────────────────────────────────
-function showAuthTab(tab) {
-  document.getElementById('loginForm').style.display = tab === 'login' ? 'block' : 'none';
-  document.getElementById('inviteForm').style.display = tab === 'invite' ? 'block' : 'none';
-  document.getElementById('loginTab').classList.toggle('active', tab === 'login');
-  document.getElementById('inviteTab').classList.toggle('active', tab === 'invite');
+let inviteToken = null;
+async function doInviteNext() {
+  const raw = qs('#inviteCode').value.trim();
+  const token = raw.includes('invite=') ? raw.split('invite=')[1] : raw;
+  if (!inviteToken) {
+    const data = await api('/api/auth/invite?token=' + token);
+    if (data.error) { toast('❌ ' + data.error); return; }
+    inviteToken = token;
+    qs('#inviteName').value = data.name || '';
+    qs('#inviteNameRow').style.display = 'block';
+    qs('#inviteBtn').textContent = 'Join Family';
+  } else {
+    const name = qs('#inviteName').value.trim();
+    const password = qs('#invitePass').value;
+    if (!name || password.length < 6) { toast('Fill in name and password (6+ chars)'); return; }
+    const data = await api('/api/auth/register', {method:'POST',body:JSON.stringify({token:inviteToken, name, password})});
+    if (data.error) { toast('❌ ' + data.error); return; }
+    session = {token: data.token, user: data.user};
+    localStorage.setItem('fh_session', JSON.stringify(session));
+    startApp();
+  }
 }
 
 async function doLogin() {
-  const name = document.getElementById('loginName').value.trim();
-  const password = document.getElementById('loginPass').value;
-  const errEl = document.getElementById('loginError');
-  errEl.style.display = 'none';
-  if (!name || !password) { showErr(errEl, 'Please fill in all fields'); return; }
-  try {
-    const res = await api('/api/auth/login', 'POST', { name, password });
-    token = res.token; me = res.user;
-    localStorage.setItem('fh_token', token);
-    showApp();
-  } catch (e) { showErr(errEl, e.message); }
+  const name = qs('#loginName').value.trim();
+  const password = qs('#loginPass').value;
+  if (!name || !password) { toast('Enter name and password'); return; }
+  const data = await api('/api/auth/login', {method:'POST', body:JSON.stringify({name, password})});
+  if (data.error) { toast('❌ ' + data.error); return; }
+  session = {token: data.token, user: data.user};
+  localStorage.setItem('fh_session', JSON.stringify(session));
+  startApp();
 }
 
-async function doRedeem() {
-  const invToken = document.getElementById('inviteToken').value.trim();
-  const name = document.getElementById('inviteName').value.trim();
-  const password = document.getElementById('invitePass').value;
-  const errEl = document.getElementById('inviteError');
-  errEl.style.display = 'none';
-  if (!invToken || !password) { showErr(errEl, 'Please fill in all fields'); return; }
-  try {
-    const res = await api('/api/auth/redeem', 'POST', { token: invToken, name, password });
-    token = res.token; me = res.user;
-    localStorage.setItem('fh_token', token);
-    showApp();
-  } catch (e) { showErr(errEl, e.message); }
+// Check invite param on load
+const urlInvite = new URLSearchParams(location.search).get('invite');
+if (urlInvite) {
+  switchAuthTab('invite');
+  qs('#inviteCode').value = urlInvite;
 }
 
-function showErr(el, msg) { el.textContent = msg; el.style.display = 'block'; }
+// ─── APP INIT ────────────────────────────────────────────────────────────────
+async function startApp() {
+  const me = await api('/api/auth/me');
+  if (me.error) { session = null; localStorage.removeItem('fh_session'); return; }
+  currentUser = me;
+  qs('#authScreen').style.display = 'none';
+  qs('#mainApp').style.display = 'flex';
+  qs('#mainApp').style.flexDirection = 'column';
+  qs('#mainApp').style.flex = '1';
 
-// ── APP INIT ───────────────────────────────────────────────────────────────
-async function showApp() {
-  document.getElementById('authScreen').style.display = 'none';
-  document.getElementById('mainApp').classList.add('visible');
-  updateHeader();
-  allUsers = await api('/api/users');
-  switchTab('Feed');
+  // Load users
+  allUsers = (await api('/api/users')) || [];
+  loadFeed();
+  loadStories();
+  pollNotifs();
+  setInterval(pollNotifs, 15000);
 }
 
-function updateHeader() {
-  if (!me) return;
-  const initial = me.name ? me.name[0].toUpperCase() : '?';
-  document.getElementById('headerAvatar').textContent = initial;
-  document.getElementById('composeAvatar').textContent = initial;
+if (session?.token) startApp();
+else qs('#authScreen').style.display = 'flex';
+
+// ─── NAV ────────────────────────────────────────────────────────────────────
+function switchScreen(name) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('screen'+name).classList.add('active');
+  document.getElementById('nav'+name).classList.add('active');
+  // lazy load
+  if (name==='Chats') loadChats();
+  if (name==='Events') loadEvents();
+  if (name==='More') loadMoreTab(currentMoreTab);
+  if (name==='Profile') loadProfile();
 }
 
-// ── NAVIGATION ─────────────────────────────────────────────────────────────
-function switchTab(tab) {
-  currentTab = tab;
-  const tabs = ['Feed','Chats','Birthdays','KK','Expenses'];
-  tabs.forEach(t => {
-    document.getElementById('screen' + t).classList.toggle('active', t === tab);
-    document.getElementById('nav' + t).classList.toggle('active', t === tab);
-  });
-  const fab = document.getElementById('fab');
-  fab.classList.toggle('visible', ['Feed','Chats','Birthdays','Expenses'].includes(tab));
-  const titles = { Feed: 'Family Hub 🏠', Chats: 'Chats 💬', Birthdays: 'Birthdays & Gifts 🎂', KK: 'Christmas KK 🎅', Expenses: 'Shared Expenses 💸' };
-  document.getElementById('headerTitle').textContent = titles[tab];
-  document.getElementById('headerSub').textContent = me?.name ? 'Hi ' + me.name + '! 👋' : 'Everyone\'s here';
-  if (tab === 'Feed') loadFeed();
-  if (tab === 'Chats') loadChats();
-  if (tab === 'Birthdays') loadBirthdays();
-  if (tab === 'KK') loadKK();
-  if (tab === 'Expenses') loadExpenses();
-}
-
-function onFabClick() {
-  if (currentTab === 'Feed') openModal('composeModal');
-  else if (currentTab === 'Chats') { populateMemberPicker('chatMemberPicker', []); openModal('newChatModal'); }
-  else if (currentTab === 'Birthdays') openModal('addGiftModal');
-  else if (currentTab === 'Expenses') { populateSplitPicker(); openModal('addExpenseModal'); }
-}
-
-// ── MODALS ─────────────────────────────────────────────────────────────────
-function openModal(id) { document.getElementById(id).classList.add('open'); }
-function closeModal(id) { document.getElementById(id).classList.remove('open'); }
-
-// ── TOAST ──────────────────────────────────────────────────────────────────
-function toast(msg) {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.classList.add('show');
-  setTimeout(() => el.classList.remove('show'), 2800);
-}
-
-// ── FEED ───────────────────────────────────────────────────────────────────
-async function loadFeed() {
-  const list = document.getElementById('feedList');
-  list.innerHTML = '<div class="loading"><div class="spinner"></div>Loading feed...</div>';
-  try {
-    const posts = await api('/api/posts');
-    if (!posts.length) {
-      list.innerHTML = '<div class="empty"><div class="empty-icon">📭</div><div class="empty-text">No posts yet</div><div class="empty-sub">Be the first to post something! 🎉</div></div>';
-      return;
-    }
-    list.innerHTML = posts.map(p => postHTML(p)).join('');
-  } catch (e) { list.innerHTML = '<div class="empty"><div class="empty-icon">😬</div><div class="empty-text">' + e.message + '</div></div>'; }
-}
-
-function postHTML(p) {
-  const initial = p.author_name ? p.author_name[0].toUpperCase() : '?';
-  const imgs = (() => { try { return JSON.parse(p.media_urls || '[]'); } catch { return []; } })();
-  const typeEmoji = { photo: '📸', milestone: '🎉', holiday: '✈️', post: '' }[p.post_type] || '';
-  return \`<div class="post-card" id="post-\${p.id}">
-    <div class="post-header">
-      <div class="post-avatar">\${initial}</div>
-      <div>
-        <div class="post-author">\${esc(p.author_name)} \${typeEmoji}</div>
-        <div class="post-time">\${timeAgo(p.created_at)}</div>
-      </div>
+// ─── STORIES ────────────────────────────────────────────────────────────────
+async function loadStories() {
+  const stories = await api('/api/stories');
+  currentStories = stories || [];
+  const strip = qs('#storiesStrip');
+  const wrap = qs('#storiesWrap');
+  // Add "my story" button
+  strip.innerHTML = \`<div class="story-item" onclick="openModal('storyModal')">
+    <div style="width:58px;height:58px;border-radius:50%;background:var(--surface2);display:flex;align-items:center;justify-content:center;border:2px dashed var(--primary)">
+      <span style="font-size:24px;color:var(--primary)">+</span>
     </div>
-    \${p.content ? '<div class="post-content">' + esc(p.content) + '</div>' : ''}
-    \${imgs.length ? imgs.map(u => '<img class="post-image" src="' + esc(u) + '" onerror="this.style.display=\'none\'">').join('') : ''}
-    <div class="post-actions">
-      <button class="post-action \${p.liked_by_me ? 'liked' : ''}" onclick="toggleLike(\${p.id}, this)">
-        \${p.liked_by_me ? '❤️' : '🤍'} <span class="like-count">\${p.likes_count || 0}</span>
-      </button>
-      <button class="post-action" onclick="toggleComments(\${p.id})">💬 \${p.comments_count || 0}</button>
-    </div>
-    <div id="comments-\${p.id}" class="post-comments" style="display:none">
-      <div id="comment-list-\${p.id}"></div>
-      <div class="comment-input-row">
-        <input id="comment-input-\${p.id}" placeholder="Write a comment..." onkeydown="if(event.key==='Enter')submitComment(\${p.id})">
-        <button class="comment-send" onclick="submitComment(\${p.id})">→</button>
-      </div>
-    </div>
+    <span>My Story</span>
   </div>\`;
-}
 
-async function toggleLike(postId, btn) {
-  try {
-    const res = await api('/api/posts/' + postId + '/like', 'POST');
-    const countEl = btn.querySelector('.like-count');
-    const count = parseInt(countEl.textContent);
-    if (res.liked) { btn.classList.add('liked'); btn.innerHTML = '❤️ <span class="like-count">' + (count+1) + '</span>'; }
-    else { btn.classList.remove('liked'); btn.innerHTML = '🤍 <span class="like-count">' + Math.max(0,count-1) + '</span>'; }
-  } catch {}
-}
-
-async function toggleComments(postId) {
-  const el = document.getElementById('comments-' + postId);
-  const visible = el.style.display !== 'none';
-  el.style.display = visible ? 'none' : 'block';
-  if (!visible) {
-    const listEl = document.getElementById('comment-list-' + postId);
-    listEl.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:8px 0">Loading...</div>';
-    const comments = await api('/api/posts/' + postId + '/comments');
-    listEl.innerHTML = comments.length ? comments.map(c =>
-      '<div class="comment"><span class="comment-author">' + esc(c.author_name) + '</span> ' + esc(c.content) + '</div>'
-    ).join('') : '<div style="color:var(--muted);font-size:13px;padding:8px 0">No comments yet</div>';
+  // Group by user
+  const byUser = {};
+  for (const s of currentStories) {
+    if (!byUser[s.user_id]) byUser[s.user_id] = [];
+    byUser[s.user_id].push(s);
   }
-}
-
-async function submitComment(postId) {
-  const input = document.getElementById('comment-input-' + postId);
-  const content = input.value.trim();
-  if (!content) return;
-  try {
-    const c = await api('/api/posts/' + postId + '/comments', 'POST', { content });
-    const listEl = document.getElementById('comment-list-' + postId);
-    listEl.innerHTML += '<div class="comment"><span class="comment-author">' + esc(c.author_name) + '</span> ' + esc(c.content) + '</div>';
-    input.value = '';
-  } catch {}
-}
-
-async function submitPost() {
-  const content = document.getElementById('postContent').value.trim();
-  const imageUrl = document.getElementById('postImageUrl').value.trim();
-  const post_type = document.getElementById('postType').value;
-  if (!content && !imageUrl) { toast('Add some text or a photo!'); return; }
-  try {
-    await api('/api/posts', 'POST', { content, media_urls: imageUrl ? [imageUrl] : [], post_type });
-    closeModal('composeModal');
-    document.getElementById('postContent').value = '';
-    document.getElementById('postImageUrl').value = '';
-    loadFeed();
-    toast('Posted! 🎉');
-  } catch (e) { toast('Error: ' + e.message); }
-}
-
-// ── CHATS ──────────────────────────────────────────────────────────────────
-async function loadChats() {
-  const list = document.getElementById('chatList');
-  list.innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
-  try {
-    const chats = await api('/api/chats');
-    if (!chats.length) {
-      list.innerHTML = '<div class="empty"><div class="empty-icon">💬</div><div class="empty-text">No chats yet</div><div class="empty-sub">Start a family group chat!</div></div>';
-      return;
-    }
-    list.innerHTML = chats.map(c => \`<div class="chat-item" onclick="openChat(\${c.id}, '\${esc(c.name)}', '\${c.chat_type}')">
-      <div class="chat-icon \${c.chat_type === 'direct' ? 'dm' : ''}">\${c.chat_type === 'direct' ? '👤' : '👨‍👩‍👧'}</div>
-      <div style="flex:1;min-width:0">
-        <div class="chat-name">\${esc(c.name)}</div>
-        <div class="chat-preview">\${c.last_author ? esc(c.last_author) + ': ' + esc(c.last_message || '') : 'No messages yet'}</div>
+  for (const [uid, stories] of Object.entries(byUser)) {
+    const first = stories[0];
+    const seen = stories.every(s => s.seen);
+    strip.innerHTML += \`<div class="story-item" onclick="viewStories(\${JSON.stringify(stories).replace(/"/g,'&quot;')})">
+      <div class="story-ring \${seen?'seen':''}">
+        <div class="avatar" style="width:100%;height:100%;border:2px solid var(--surface);background:\${first.avatar_color||'#6366f1'}">\${initials(first.name)}</div>
       </div>
-      <div class="chat-time">\${c.last_at ? timeAgo(c.last_at) : ''}</div>
-    </div>\`).join('');
-  } catch (e) { list.innerHTML = '<div class="empty"><div class="empty-icon">😬</div><div class="empty-text">' + e.message + '</div></div>'; }
+      <span>\${first.name}</span>
+    </div>\`;
+  }
+  wrap.style.display = currentStories.length > 0 ? 'block' : 'none';
 }
 
-function openChat(id, name, type) {
-  currentChatId = id;
-  document.getElementById('chatViewName').textContent = name;
-  document.getElementById('chatViewType').textContent = type === 'direct' ? 'Private chat' : 'Group chat';
-  document.getElementById('chatView').classList.add('open');
-  loadMessages(id);
+function viewStories(stories) {
+  currentStories = Array.isArray(stories) ? stories : [stories];
+  storyIdx = 0;
+  showStory(0);
+  qs('#storyViewer').style.display = 'flex';
+  qs('#storyViewer').style.flexDirection = 'column';
 }
 
-function closeChat() {
-  document.getElementById('chatView').classList.remove('open');
-  currentChatId = null;
+function showStory(idx) {
+  if (idx >= currentStories.length) { closeStoryViewer(); return; }
+  const s = currentStories[idx];
+  // Progress bars
+  const bars = qs('#storyProgressBars');
+  bars.innerHTML = currentStories.map((_,i) => \`<div class="bar \${i<idx?'done':i===idx?'active':''}"></div>\`).join('');
+  if (storyTimer) clearTimeout(storyTimer);
+  qs('#storyViewerAvatar').style.background = s.avatar_color || '#6366f1';
+  qs('#storyViewerAvatar').textContent = initials(s.name);
+  qs('#storyViewerName').textContent = s.name;
+  qs('#storyViewerTime').textContent = timeAgo(s.created_at);
+  const content = qs('#storyViewerContent');
+  const viewer = qs('#storyViewer');
+  if (s.media_key) {
+    content.innerHTML = \`<img src="/api/photos/\${encodeURIComponent(s.media_key)}" style="max-width:100%;max-height:60vh;border-radius:12px">\`;
+    viewer.style.background = '#000';
+  } else {
+    content.textContent = s.content;
+    content.style.fontSize = s.content?.length < 50 ? '28px' : '20px';
+    viewer.style.background = s.bg_color || '#6366f1';
+  }
+  // Mark seen
+  api('/api/stories/' + s.id + '/view', {method:'POST'});
+  storyTimer = setTimeout(() => showStory(idx+1), 5000);
 }
 
-async function loadMessages(chatId) {
-  const container = document.getElementById('chatMessages');
-  container.innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
-  const msgs = await api('/api/chats/' + chatId + '/messages');
-  container.innerHTML = msgs.length ? msgs.map(m => msgHTML(m)).join('') : '<div class="empty"><div class="empty-icon">👋</div><div class="empty-text">Say something!</div></div>';
-  container.scrollTop = container.scrollHeight;
+function closeStoryViewer() {
+  if (storyTimer) clearTimeout(storyTimer);
+  qs('#storyViewer').style.display = 'none';
+  loadStories();
 }
 
-function msgHTML(m) {
-  const mine = m.user_id === me.id;
-  return \`<div style="display:flex;flex-direction:column;align-items:\${mine ? 'flex-end' : 'flex-start'}">
-    \${!mine ? '<div style="font-size:11px;color:var(--muted);margin-left:4px;margin-bottom:2px">' + esc(m.author_name) + '</div>' : ''}
-    <div class="msg \${mine ? 'mine' : 'theirs'}">\${esc(m.content)}
-      <div class="msg-time">\${timeAgo(m.created_at)}</div>
-    </div>
-  </div>\`;
+function setStoryType(type, btn) {
+  storyType = type;
+  document.querySelectorAll('#storyTypeToggle .tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  qs('#storyTextInput').style.display = type==='text'?'block':'none';
+  qs('#storyImageInput').style.display = type==='image'?'block':'none';
+}
+function selectBg(color, el) {
+  storyBg = color;
+  document.querySelectorAll('#bgPicker div').forEach(d => d.style.border = 'none');
+  el.style.border = '2px solid white';
+}
+async function postStory() {
+  const fd = new FormData();
+  if (storyType === 'image') {
+    const file = qs('#storyFile').files[0];
+    if (!file) { toast('Pick a photo first'); return; }
+    fd.append('media', file);
+    fd.append('type', 'image');
+  } else {
+    const content = qs('#storyContent').value.trim();
+    if (!content) { toast('Write something!'); return; }
+    fd.append('content', content);
+    fd.append('bg_color', storyBg);
+    fd.append('type', 'text');
+  }
+  const r = await apiForm('/api/stories', fd);
+  if (r.error) { toast('❌ ' + r.error); return; }
+  closeModal('storyModal');
+  qs('#storyContent').value = '';
+  toast('Story shared! 📖');
+  loadStories();
 }
 
-async function sendMessage() {
-  const input = document.getElementById('chatInputField');
-  const content = input.value.trim();
-  if (!content || !currentChatId) return;
-  input.value = ''; input.style.height = 'auto';
-  try {
-    const m = await api('/api/chats/' + currentChatId + '/messages', 'POST', { content });
-    const container = document.getElementById('chatMessages');
-    container.innerHTML += msgHTML(m);
-    container.scrollTop = container.scrollHeight;
-  } catch (e) { toast('Send failed: ' + e.message); }
-}
-
-function populateMemberPicker(containerId, selected) {
-  const el = document.getElementById(containerId);
-  el.innerHTML = allUsers.filter(u => u.id !== me.id).map(u =>
-    \`<span class="person-chip \${selected.includes(u.id) ? 'selected' : ''}" data-id="\${u.id}" onclick="toggleChip(this)">\${esc(u.name)}</span>\`
-  ).join('');
-}
-
-function toggleChip(el) { el.classList.toggle('selected'); }
-
-function getSelectedChips(containerId) {
-  return [...document.querySelectorAll('#' + containerId + ' .person-chip.selected')].map(el => parseInt(el.dataset.id));
-}
-
-async function createChat() {
-  const name = document.getElementById('newChatName').value.trim();
-  const chat_type = document.getElementById('newChatType').value;
-  const member_ids = getSelectedChips('chatMemberPicker');
-  if (!name) { toast('Give the chat a name'); return; }
-  try {
-    await api('/api/chats', 'POST', { name, chat_type, member_ids });
-    closeModal('newChatModal');
-    document.getElementById('newChatName').value = '';
-    loadChats();
-    toast('Chat created! 💬');
-  } catch (e) { toast('Error: ' + e.message); }
-}
-
-// ── BIRTHDAYS ──────────────────────────────────────────────────────────────
-async function loadBirthdays() {
-  const listEl = document.getElementById('birthdayList');
-  try {
-    const bdays = await api('/api/birthdays');
-    // Populate wishlist user picker
-    const sel = document.getElementById('wishlistUser');
-    sel.innerHTML = '<option value="">— pick a family member —</option>' +
-      allUsers.map(u => \`<option value="\${u.id}">\${esc(u.name)}\${u.id === me.id ? ' (you)' : ''}</option>\`).join('');
-
-    if (!bdays.length) {
-      listEl.innerHTML = '<div class="empty"><div class="empty-icon">🎂</div><div class="empty-text">No birthdays added yet</div></div>';
-      return;
-    }
-    const today = new Date(); today.setHours(0,0,0,0);
-    listEl.innerHTML = '<div class="section-header" style="padding:0 0 12px"><span class="section-title">📅 Upcoming Birthdays</span></div>' +
-      bdays.map(u => {
-        const bd = nextBirthday(u.birthday);
-        const days = bd ? Math.round((bd - today) / 86400000) : null;
-        return \`<div class="birthday-item">
-          <div class="birthday-avatar">\${u.name[0]}</div>
-          <div>
-            <div class="birthday-name">\${esc(u.name)}</div>
-            <div class="birthday-date">\${formatDate(u.birthday)}\${u.relationship ? ' · ' + esc(u.relationship) : ''}</div>
-          </div>
-          <div class="birthday-days">
-            \${days === 0 ? '<div class="days-today">🎂</div><div class="days-label">TODAY!</div>' :
-              days !== null ? '<div class="days-number">' + days + '</div><div class="days-label">days</div>' : ''}
-          </div>
-        </div>\`;
-      }).join('');
-  } catch (e) { listEl.innerHTML = '<div class="empty">' + e.message + '</div>'; }
-}
-
-async function loadGifts(userId) {
-  if (!userId) { document.getElementById('giftList').innerHTML = ''; return; }
-  const listEl = document.getElementById('giftList');
-  listEl.innerHTML = '<div class="loading" style="padding:16px"><div class="spinner"></div>Loading...</div>';
-  const gifts = await api('/api/gifts?user_id=' + userId);
-  const isMe = parseInt(userId) === me.id;
-  if (!gifts.length) {
-    listEl.innerHTML = \`<div style="padding:16px;color:var(--muted);font-size:14px">No wish list yet.\${isMe ? ' <button class="btn btn-sm" style="display:inline;width:auto;margin-left:8px" onclick="openModal(\'addGiftModal\')">Add items</button>' : ''}</div>\`;
+// ─── FEED ────────────────────────────────────────────────────────────────────
+async function loadFeed() {
+  const posts = await api('/api/posts?limit=20');
+  const list = qs('#feedList');
+  if (!posts?.length) {
+    list.innerHTML = '<div class="empty-state"><div class="icon">🏠</div><p>No posts yet. Say hi to the family!</p></div>';
     return;
   }
-  listEl.innerHTML = '<div style="padding:0 0 8px">' + gifts.map(g => \`<div class="gift-item \${g.claimed_by ? 'gift-claimed' : ''}">
-    <div style="flex:1">
-      <div class="gift-title">\${esc(g.title)}\${g.price ? ' · €' + g.price : ''}</div>
-      <div class="gift-meta">\${g.description ? esc(g.description) + ' ' : ''}\${g.url ? '<a href="' + esc(g.url) + '" target="_blank" style="color:var(--primary)">View →</a>' : ''}</div>
-      \${g.claimed_by && !isMe ? '<div style="font-size:11px;color:#00b894;font-weight:700">✓ Claimed by ' + esc(g.claimed_by_name || 'someone') + '</div>' : ''}
-      \${g.claimed_by && isMe ? '<div style="font-size:11px;color:#00b894;font-weight:700">✓ Someone\'s got this!</div>' : ''}
+  list.innerHTML = posts.map(p => renderPost(p)).join('');
+}
+function renderPost(p) {
+  const mediaHtml = p.media?.length ? \`<div class="post-media count-\${Math.min(p.media.length,4)}">\${p.media.slice(0,4).map(m=>\`<img src="/api/photos/\${encodeURIComponent(m.r2_key)}" onclick="viewImg('\${m.r2_key}')" loading="lazy">\`).join('')}</div>\` : '';
+  const emoji = p.my_reaction || '❤️';
+  return \`<div class="post-card">
+    <div class="post-header">
+      <div class="avatar" style="background:\${p.avatar_color||'#6366f1'}">\${initials(p.author_name)}</div>
+      <div>
+        <div style="font-weight:700;font-size:15px">\${p.author_name}</div>
+        <div class="text-xs text-muted">\${timeAgo(p.created_at)}</div>
+      </div>
     </div>
-    \${!isMe ? '<button class="btn btn-sm \${g.claimed_by && g.claimed_by !== me.id ? 'btn-ghost' : ''}" style="flex-shrink:0" onclick="claimGift(\${g.id}, this)">\${g.claimed_by === me.id ? 'Unclaim' : g.claimed_by ? 'Taken' : 'I\'ll get it!'}</button>' : ''}
-    \${isMe ? '<button class="btn btn-sm btn-ghost" style="flex-shrink:0;font-size:12px" onclick="deleteGift(\${g.id})">✕</button>' : ''}
-  </div>\`).join('') + '</div>';
+    \${p.content ? \`<div class="post-content">\${p.content}</div>\` : ''}
+    \${mediaHtml}
+    <div class="post-actions">
+      <div class="post-action \${p.my_reaction?'liked':''}" onclick="reactPost('\${p.id}','❤️',this)">
+        <span>❤️</span> <span>\${p.reaction_count||0}</span>
+      </div>
+      <div class="post-action" onclick="loadComments('\${p.id}','\${p.author_name}')">
+        <span>💬</span> <span>\${p.comment_count||0}</span>
+      </div>
+    </div>
+  </div>\`;
+}
+async function reactPost(postId, reaction, el) {
+  const r = await api('/api/posts/' + postId + '/react', {method:'POST', body:JSON.stringify({reaction})});
+  if (!r.error) loadFeed();
+}
+function viewImg(key) {
+  window.open('/api/photos/' + encodeURIComponent(key), '_blank');
+}
+let commentPostId = null;
+async function loadComments(postId, authorName) {
+  commentPostId = postId;
+  const comments = await api('/api/posts/' + postId + '/comments');
+  // Simple inline comment view - show in a temp modal
+  let html = \`<div style="position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:250;display:flex;flex-direction:column;max-height:100vh">
+    <div style="background:var(--surface);flex:1;overflow-y:auto;padding:16px;padding-top:56px">
+      <button onclick="this.parentElement.parentElement.remove()" style="position:fixed;top:12px;right:16px;background:none;border:none;color:var(--muted);font-size:24px;cursor:pointer;z-index:1">×</button>
+      <h3 style="margin-bottom:12px">Comments</h3>
+      \${!comments.length ? '<p style="color:var(--muted)">No comments yet</p>' : ''}
+      \${(comments||[]).map(c=>\`<div style="display:flex;gap:8px;margin-bottom:12px">
+        <div class="avatar avatar-sm" style="background:\${c.avatar_color||'#6366f1'}">\${initials(c.name)}</div>
+        <div><span style="font-weight:600;font-size:13px">\${c.name}</span> <span style="color:var(--muted);font-size:12px">\${timeAgo(c.created_at)}</span>
+        <p style="font-size:14px;margin-top:2px">\${c.content}</p></div>
+      </div>\`).join('')}
+    </div>
+    <div style="background:var(--surface);padding:12px;display:flex;gap:8px;border-top:1px solid var(--border)">
+      <input type="text" id="commentInput" placeholder="Add a comment..." style="flex:1">
+      <button class="btn btn-primary btn-sm" onclick="submitComment()">Post</button>
+    </div>
+  </div>\`;
+  document.body.insertAdjacentHTML('beforeend', html);
+}
+async function submitComment() {
+  const input = document.getElementById('commentInput');
+  const content = input.value.trim();
+  if (!content) return;
+  await api('/api/posts/' + commentPostId + '/comments', {method:'POST', body:JSON.stringify({content})});
+  input.value = '';
+  document.querySelector('[id^="commentInput"]')?.closest('[style*="position:fixed"]')?.remove();
+  loadFeed();
+}
+let postMediaFiles = [];
+function previewPostMedia() {
+  const files = Array.from(qs('#postMediaInput').files);
+  postMediaFiles = files;
+  const preview = qs('#postMediaPreview');
+  preview.innerHTML = files.map((f,i) => \`<div style="position:relative"><img src="\${URL.createObjectURL(f)}" style="width:64px;height:64px;object-fit:cover;border-radius:8px"><button onclick="removePostMedia(\${i})" style="position:absolute;top:-4px;right:-4px;background:var(--danger);border:none;color:#fff;width:18px;height:18px;border-radius:50%;font-size:11px;cursor:pointer">×</button></div>\`).join('');
+}
+function removePostMedia(i) { postMediaFiles.splice(i,1); previewPostMedia(); }
+async function submitPost() {
+  const content = qs('#postContent').value.trim();
+  const fd = new FormData();
+  fd.append('content', content);
+  for (const f of postMediaFiles) fd.append('media', f);
+  if (!content && postMediaFiles.length === 0) { toast('Empty post'); return; }
+  const r = await apiForm('/api/posts', fd);
+  if (r.error) { toast('❌ ' + r.error); return; }
+  closeModal('newPostModal');
+  qs('#postContent').value = '';
+  postMediaFiles = [];
+  qs('#postMediaPreview').innerHTML = '';
+  toast('Posted! 🎉');
+  loadFeed();
 }
 
-async function claimGift(giftId, btn) {
-  try {
-    const res = await api('/api/gifts/' + giftId + '/claim', 'POST');
-    toast(res.claimed ? '✓ Claimed!' : 'Unclaimed');
-    loadGifts(document.getElementById('wishlistUser').value);
-  } catch (e) { toast(e.message); }
+// ─── CHATS ────────────────────────────────────────────────────────────────────
+async function loadChats() {
+  const chats = await api('/api/chats');
+  const list = qs('#chatList');
+  if (!chats?.length) { list.innerHTML = '<div class="empty-state"><div class="icon">💬</div><p>No chats yet</p></div>'; return; }
+  list.innerHTML = chats.map(c => {
+    const name = c.name || c.members?.filter(m=>m.id!==currentUser?.id).map(m=>m.name).join(', ') || 'Chat';
+    const avatarColor = c.members?.find(m=>m.id!==currentUser?.id)?.avatar_color || '#6366f1';
+    const avatarTxt = c.is_group ? '👨‍👩‍👧‍👦' : initials(name);
+    return \`<div class="chat-item" onclick="openChat('\${c.id}',\${JSON.stringify(name).replace(/"/g,'&quot;')})">
+      <div class="avatar" style="background:\${c.is_group?'#4f46e5':avatarColor}">\${c.is_group?'👨‍👩‍👧‍👦':initials(name)}</div>
+      <div class="chat-meta">
+        <h3>\${name}</h3>
+        <p>\${c.last_msg || (c.last_sender?c.last_sender+': ...':'No messages')}</p>
+      </div>
+      <div class="chat-time">\${timeAgo(c.last_msg_at||c.created_at)}</div>
+    </div>\`;
+  }).join('');
+  // Load users for new chat
+  const boxes = qs('#userCheckboxes');
+  if (allUsers.length) {
+    boxes.innerHTML = allUsers.filter(u=>u.id!==currentUser?.id).map(u =>
+      \`<label style="display:flex;gap:8px;align-items:center;cursor:pointer;padding:6px;background:var(--surface2);border-radius:8px">
+        <input type="checkbox" value="\${u.id}" style="width:auto"> \${u.name} <span style="color:var(--muted);font-size:12px">(\${u.role})</span>
+      </label>\`
+    ).join('');
+  }
+}
+async function createChat() {
+  const name = qs('#newChatName').value.trim();
+  const selected = Array.from(document.querySelectorAll('#userCheckboxes input:checked')).map(i=>i.value);
+  if (!selected.length) { toast('Pick at least one person'); return; }
+  const r = await api('/api/chats', {method:'POST', body:JSON.stringify({name: name||null, member_ids:selected, is_group: selected.length>1})});
+  if (r.error) { toast('❌ ' + r.error); return; }
+  closeModal('newChatModal');
+  toast('Chat created!');
+  loadChats();
+  openChat(r.id, name || 'Chat');
+}
+function openChat(chatId, chatName) {
+  currentChatId = chatId;
+  currentChatName = chatName;
+  lastMsgTime = null;
+  qs('#chatScreenName').textContent = chatName;
+  qs('#chatScreen').classList.add('open');
+  loadMessages(chatId);
+  if (chatPollInterval) clearInterval(chatPollInterval);
+  chatPollInterval = setInterval(() => pollMessages(chatId), 3000);
+}
+function closeChat() {
+  qs('#chatScreen').classList.remove('open');
+  if (chatPollInterval) clearInterval(chatPollInterval);
+  currentChatId = null;
+}
+async function loadMessages(chatId) {
+  const msgs = await api('/api/chats/'+chatId+'/messages?limit=50');
+  if (msgs?.length) lastMsgTime = msgs[msgs.length-1].created_at;
+  renderMessages(msgs||[], true);
+}
+async function pollMessages(chatId) {
+  if (!lastMsgTime) return;
+  const since = new URL('/', location.href);
+  const newMsgs = await api('/api/chats/'+chatId+'/stream?since='+encodeURIComponent(lastMsgTime));
+  if (newMsgs?.length) {
+    lastMsgTime = newMsgs[newMsgs.length-1].created_at;
+    appendMessages(newMsgs);
+  }
+}
+function renderMessages(msgs, scroll=false) {
+  const container = qs('#chatMessages');
+  container.innerHTML = msgs.map(m => renderMsg(m)).join('');
+  if (scroll) container.scrollTop = container.scrollHeight;
+}
+function appendMessages(msgs) {
+  const container = qs('#chatMessages');
+  const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
+  msgs.forEach(m => container.insertAdjacentHTML('beforeend', renderMsg(m)));
+  if (atBottom) container.scrollTop = container.scrollHeight;
+}
+function renderMsg(m) {
+  const mine = m.user_id === currentUser?.id;
+  let content = '';
+  if (m.msg_type === 'image' && m.media_key) {
+    content = \`<img src="/api/photos/\${encodeURIComponent(m.media_key)}" style="max-width:220px;border-radius:12px;display:block" onclick="viewImg('\${m.media_key}')">\`;
+  } else if (m.msg_type === 'file' && m.media_key) {
+    content = \`<a href="/api/photos/\${encodeURIComponent(m.media_key)}" target="_blank" style="color:\${mine?'#fff':'var(--primary)'}">📎 \${m.media_key.split('/').pop()}</a>\`;
+  } else {
+    content = m.content?.replace(/\\n/g,'<br>') || '';
+  }
+  const reactions = (m.reactions||[]).map(r => \`<span class="reaction-pill" onclick="reactMsg('\${m.id}','\${r.reaction}')">\${r.reaction} \${r.c}</span>\`).join('');
+  return \`<div class="msg-row" style="\${mine?'align-items:flex-end':'align-items:flex-start'}">
+    \${!mine ? \`<div class="msg-sender">\${m.sender_name}</div>\` : ''}
+    <div class="msg-bubble \${mine?'mine':'theirs'}" ondblclick="reactMsg('\${m.id}','❤️')">\${content}</div>
+    \${reactions ? \`<div class="msg-reactions">\${reactions}</div>\` : ''}
+  </div>\`;
+}
+async function reactMsg(msgId, reaction) {
+  if (!currentChatId) return;
+  await api('/api/chats/'+currentChatId+'/messages/'+msgId+'/react', {method:'POST', body:JSON.stringify({reaction})});
+}
+async function sendMsg() {
+  if (!currentChatId) return;
+  const input = qs('#chatMsgInput');
+  const content = input.value.trim();
+  if (!content) return;
+  input.value = '';
+  input.style.height = 'auto';
+  const r = await api('/api/chats/'+currentChatId+'/messages', {method:'POST', body:JSON.stringify({content})});
+  if (!r.error) {
+    const now = new Date().toISOString();
+    appendMessages([{id:r.id, user_id:currentUser.id, content, msg_type:'text', created_at:now, sender_name:currentUser.name}]);
+    lastMsgTime = now;
+  }
+}
+async function sendChatFile() {
+  const file = qs('#chatFileInput').files[0];
+  if (!file || !currentChatId) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  const headers = {};
+  if (session?.token) headers['x-session-token'] = session.token;
+  const r = await fetch('/api/chats/'+currentChatId+'/messages', {method:'POST', headers, body:fd}).then(r=>r.json());
+  if (r.error) toast('❌ ' + r.error);
+  else { toast('File sent!'); lastMsgTime = new Date().toISOString(); }
+}
+function handleMsgKey(e) {
+  if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+  // Auto-resize
+  const ta = e.target;
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
 }
 
-async function deleteGift(giftId) {
-  await api('/api/gifts/' + giftId, 'DELETE');
-  loadGifts(me.id);
-  toast('Removed');
+// Load users for new chat & transfer
+async function loadUsersForSelects() {
+  if (!allUsers.length) allUsers = await api('/api/users') || [];
+  const select = qs('#transferTo');
+  if (select) select.innerHTML = allUsers.filter(u=>u.id!==currentUser?.id).map(u=>\`<option value="\${u.id}">\${u.name}</option>\`).join('');
+  const expUsers = qs('#expSplitUsers');
+  if (expUsers) expUsers.innerHTML = allUsers.filter(u=>u.id!==currentUser?.id).map(u=>\`<label style="display:flex;gap:8px;align-items:center;cursor:pointer;padding:6px;background:var(--surface2);border-radius:8px"><input type="checkbox" value="\${u.id}" style="width:auto"> \${u.name}</label>\`).join('');
 }
 
-async function submitGift() {
-  const title = document.getElementById('giftTitle').value.trim();
-  if (!title) { toast('Give it a name!'); return; }
-  try {
-    await api('/api/gifts', 'POST', {
-      title,
-      description: document.getElementById('giftDesc').value.trim(),
-      url: document.getElementById('giftUrl').value.trim(),
-      price: parseFloat(document.getElementById('giftPrice').value) || null,
-      event_type: document.getElementById('giftEvent').value
-    });
-    closeModal('addGiftModal');
-    ['giftTitle','giftDesc','giftUrl','giftPrice'].forEach(id => document.getElementById(id).value = '');
-    loadGifts(me.id);
-    document.getElementById('wishlistUser').value = me.id;
-    toast('Added to your wish list! 🎁');
-  } catch (e) { toast('Error: ' + e.message); }
+// ─── EVENTS ────────────────────────────────────────────────────────────────────
+async function loadEvents() {
+  const events = await api('/api/events');
+  const list = qs('#eventsList');
+  if (!events?.length) { list.innerHTML = '<div class="empty-state"><div class="icon">📅</div><p>No events yet</p></div>'; return; }
+  list.innerHTML = events.map(e => {
+    const d = new Date(e.starts_at);
+    return \`<div class="event-card">
+      <div class="event-date">\${d.toLocaleDateString('en-IE',{weekday:'short',month:'short',day:'numeric'})} · \${d.toLocaleTimeString('en-IE',{hour:'2-digit',minute:'2-digit'})}</div>
+      <div style="font-weight:700;font-size:16px;margin-bottom:4px">\${e.title}</div>
+      \${e.location?\`<div style="font-size:13px;color:var(--muted)">📍 \${e.location}</div>\`:''}
+      \${e.description?\`<div style="font-size:14px;color:var(--muted);margin-top:4px">\${e.description}</div>\`:''}
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn btn-sm \${e.my_rsvp==='going'?'btn-primary':'btn-ghost'}" onclick="rsvp('\${e.id}','going')">✅ Going\${e.going_count?\` (${e.going_count})\`:''}</button>
+        <button class="btn btn-sm \${e.my_rsvp==='maybe'?'btn-primary':'btn-ghost'}" onclick="rsvp('\${e.id}','maybe')">🤔 Maybe</button>
+        <button class="btn btn-sm \${e.my_rsvp==='no'?'btn-danger':'btn-ghost'}" onclick="rsvp('\${e.id}','no')">❌ No</button>
+      </div>
+    </div>\`;
+  }).join('');
+}
+async function createEvent() {
+  const title = qs('#eventTitle').value.trim();
+  const starts_at = qs('#eventStart').value;
+  if (!title || !starts_at) { toast('Title and date required'); return; }
+  const r = await api('/api/events', {method:'POST', body:JSON.stringify({title, starts_at, location:qs('#eventLocation').value||null, description:qs('#eventDesc').value||null})});
+  if (r.error) { toast('❌ ' + r.error); return; }
+  closeModal('newEventModal'); toast('Event added! 📅'); loadEvents();
+}
+async function rsvp(eventId, status) {
+  await api('/api/events/'+eventId+'/rsvp', {method:'POST', body:JSON.stringify({status})});
+  loadEvents();
 }
 
-// ── KK ─────────────────────────────────────────────────────────────────────
+// ─── MORE TABS ────────────────────────────────────────────────────────────────
+function switchMoreTab(tab) {
+  currentMoreTab = tab;
+  document.querySelectorAll('#moreTabs .tab').forEach(t => t.classList.remove('active'));
+  document.querySelector(\`#moreTabs .tab[onclick*="\${tab}"]\`)?.classList.add('active');
+  loadMoreTab(tab);
+}
+function loadMoreTab(tab) {
+  const c = qs('#moreContent');
+  c.innerHTML = '<div class="spinner"></div>';
+  if (tab==='birthdays') loadBirthdays();
+  if (tab==='gifts') loadGifts();
+  if (tab==='kk') loadKK();
+  if (tab==='expenses') loadExpenses();
+  if (tab==='transfers') loadTransfers();
+  if (tab==='vault') loadVault();
+}
+
+async function loadBirthdays() {
+  const bdays = await api('/api/birthdays');
+  const c = qs('#moreContent');
+  const today = new Date();
+  c.innerHTML = \`<div style="padding:16px">
+    <div style="margin-bottom:16px">
+      <p style="color:var(--muted);font-size:13px;margin-bottom:8px">Your birthday</p>
+      <div style="display:flex;gap:8px">
+        <input type="date" id="myBday" style="flex:1">
+        <button class="btn btn-primary btn-sm" onclick="saveBday()">Save</button>
+      </div>
+    </div>
+    <h3 style="margin-bottom:12px">Family Birthdays</h3>
+    \${!bdays?.length ? '<p style="color:var(--muted)">No birthdays added yet</p>' : ''}
+    \${(bdays||[]).map(b => {
+      const d = new Date(b.date+'T12:00:00');
+      const thisYear = new Date(today.getFullYear(), d.getMonth(), d.getDate());
+      const daysUntil = Math.ceil((thisYear - today) / 86400000);
+      const upcoming = daysUntil >= 0 && daysUntil <= 30;
+      return \`<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)">
+        <div class="avatar" style="background:\${b.avatar_color||'#6366f1'}">\${initials(b.name)}</div>
+        <div style="flex:1">
+          <div style="font-weight:600">\${b.name}</div>
+          <div style="font-size:13px;color:var(--muted)">\${d.toLocaleDateString('en-IE',{day:'numeric',month:'long'})}</div>
+        </div>
+        \${upcoming ? \`<span style="background:var(--warning);color:#000;border-radius:99px;padding:2px 10px;font-size:12px;font-weight:700">🎂 \${daysUntil===0?'Today!':daysUntil+'d'}</span>\` : ''}
+      </div>\`;
+    }).join('')}
+  </div>\`;
+  // Pre-fill user's own birthday
+  const myBday = bdays?.find(b=>b.user_id===currentUser?.id);
+  if (myBday) qs('#myBday').value = myBday.date;
+}
+async function saveBday() {
+  const date = qs('#myBday').value;
+  if (!date) return;
+  await api('/api/birthdays', {method:'POST', body:JSON.stringify({date})});
+  toast('Birthday saved! 🎂'); loadBirthdays();
+}
+
+async function loadGifts() {
+  const c = qs('#moreContent');
+  const users = allUsers.length ? allUsers : await api('/api/users');
+  const myGifts = await api('/api/gifts?user=' + currentUser?.id);
+  c.innerHTML = \`<div style="padding:12px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3>My Wish List</h3>
+      <button class="btn btn-sm btn-primary" onclick="openModal('newGiftModal')">+ Add</button>
+    </div>
+    \${!myGifts?.length ? '<p style="color:var(--muted);margin-bottom:16px">Nothing on your list yet</p>' : ''}
+    \${(myGifts||[]).map(g => \`<div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)">
+      <div style="flex:1">
+        <div style="font-weight:600">\${g.title}</div>
+        \${g.url?\`<a href="\${g.url}" target="_blank" style="font-size:13px;color:var(--primary)">View item</a>\`:''}
+        \${g.price?\`<span style="font-size:13px;color:var(--muted)"> · €\${g.price}</span>\`:''}
+      </div>
+      <span style="font-size:12px;color:\${g.status==='claimed'?'var(--warning)':'var(--muted)'}">\${g.status==='claimed'?'🎁 Claimed':'Available'}</span>
+      <button onclick="deleteGift('\${g.id}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px">×</button>
+    </div>\`).join('')}
+    <h3 style="margin:16px 0 10px">Family Wish Lists</h3>
+    \${users.filter(u=>u.id!==currentUser?.id).map(u => \`<div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="viewGifts('\${u.id}','\${u.name}')">
+      <div class="avatar avatar-sm" style="background:\${u.avatar_color||'#6366f1'}">\${initials(u.name)}</div>
+      <span style="font-weight:600">\${u.name}</span>
+      <span style="margin-left:auto;color:var(--primary);font-size:13px">View →</span>
+    </div>\`).join('')}
+  </div>\`;
+}
+async function deleteGift(id) {
+  await api('/api/gifts/'+id, {method:'DELETE'});
+  loadGifts();
+}
+async function viewGifts(userId, userName) {
+  const gifts = await api('/api/gifts?user='+userId);
+  const c = qs('#moreContent');
+  c.innerHTML = \`<div style="padding:12px">
+    <button onclick="loadGifts()" style="background:none;border:none;color:var(--primary);cursor:pointer;margin-bottom:12px">← Back</button>
+    <h3>\${userName}'s Wish List</h3>
+    \${!gifts?.length ? '<p style="color:var(--muted);margin-top:12px">Nothing on their list yet</p>' : ''}
+    \${(gifts||[]).map(g => \`<div style="display:flex;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid var(--border)">
+      <div style="flex:1">
+        <div style="font-weight:600">\${g.title}</div>
+        \${g.url?\`<a href="\${g.url}" target="_blank" style="font-size:13px;color:var(--primary)">View →</a>\`:''}
+        \${g.price?\`<span style="font-size:13px;color:var(--muted)"> · €\${g.price}</span>\`:''}
+      </div>
+      <button class="btn btn-sm \${g.claimed_by_label==='you'?'btn-danger':'btn-ghost'}" onclick="claimGift('\${g.id}')">
+        \${g.claimed_by_label==='you'?'Unclaim':g.claimed_by_label==='someone'?'🔒 Taken':'🎁 Claim'}
+      </button>
+    </div>\`).join('')}
+  </div>\`;
+}
+async function claimGift(id) {
+  const r = await api('/api/gifts/'+id+'/claim', {method:'POST'});
+  if (r.error) toast('❌ ' + r.error);
+  else toast(r.ok ? 'Claimed!' : 'Unclaimed');
+}
+async function addGift() {
+  const title = qs('#giftTitle').value.trim();
+  if (!title) { toast('Enter an item'); return; }
+  await api('/api/gifts', {method:'POST', body:JSON.stringify({title, url:qs('#giftUrl').value||null, price:qs('#giftPrice').value||null})});
+  closeModal('newGiftModal'); toast('Added to wish list! 🎁'); loadGifts();
+}
+
 async function loadKK() {
-  const el = document.getElementById('kkContent');
-  const draws = await api('/api/kk');
-  if (!draws.length) {
-    el.innerHTML = \`<div class="empty" style="padding-top:60px">
-      <div class="empty-icon">🎅</div>
-      <div class="empty-text">No KK draw yet</div>
-      <div class="empty-sub">Set one up for Christmas!</div>
-      <button class="btn" style="width:auto;margin-top:20px;padding:12px 24px" onclick="openModal('kkModal')">Set Up KK Draw 🎄</button>
+  const year = new Date().getFullYear();
+  const data = await api('/api/kk?year='+year);
+  const c = qs('#moreContent');
+  if (!data) {
+    c.innerHTML = \`<div style="padding:16px;text-align:center">
+      <div style="font-size:48px;margin-bottom:12px">🎅</div>
+      <h3 style="margin-bottom:8px">No KK Draw for \${year}</h3>
+      <p style="color:var(--muted);margin-bottom:20px">Set up the Secret Santa for this year</p>
+      <button class="btn btn-primary" onclick="createKK(\${year})">Create \${year} KK Draw</button>
     </div>\`;
     return;
   }
-  el.innerHTML = draws.map(d => \`
-    <div style="margin:12px">
-      <div class="kk-card">
-        <div class="kk-year">🎄 KK \${d.year} · \${d.status === 'drawn' ? 'Drawn!' : 'Not drawn yet'}\${d.budget ? ' · Budget €' + d.budget : ''}</div>
-        \${d.status === 'drawn' ? '<div id="kk-assign-' + d.id + '"><div class="loading"><div class="spinner"></div></div></div>' : ''}
-      </div>
-      \${d.status !== 'drawn' ? '<button class="btn" style="margin-top:10px" onclick="openKKDrawModal(' + d.id + ')">Draw Names! 🎲</button>' : ''}
+  const amIn = data.participants?.some(p=>p.user_id===currentUser?.id);
+  c.innerHTML = \`<div style="padding:16px">
+    <div style="text-align:center;margin-bottom:20px">
+      <div style="font-size:40px">🎅</div>
+      <h2>KK Draw \${year}</h2>
+      <p style="color:var(--muted)">Budget: €\${data.budget||50}</p>
     </div>
-  \`).join('') + '<div style="text-align:center;padding:16px"><button class="btn btn-ghost" style="width:auto;padding:10px 24px" onclick="openModal(\'kkModal\')">+ New Year</button></div>';
-
-  // Load my assignments
-  for (const d of draws.filter(d => d.status === 'drawn')) {
-    const assignment = await api('/api/kk/' + d.id + '/my-assignment');
-    const el2 = document.getElementById('kk-assign-' + d.id);
-    if (el2) {
-      el2.innerHTML = assignment
-        ? \`<div style="margin-top:12px"><div style="font-size:13px;opacity:0.7">You're buying for</div><div class="kk-receiver">\${esc(assignment.receiver_name)} 🎁</div></div>\`
-        : \`<div style="margin-top:8px;opacity:0.7;font-size:14px">Not in this draw</div>\`;
-    }
-  }
+    \${data.my_assignment ? \`<div style="background:var(--primary);border-radius:16px;padding:20px;text-align:center;margin-bottom:16px">
+      <div style="font-size:13px;opacity:.8;margin-bottom:4px">🎁 You're buying a gift for...</div>
+      <div style="font-size:28px;font-weight:800">\${data.my_assignment.name}</div>
+    </div>\` : ''}
+    \${!data.drawn ? \`<div style="margin-bottom:16px">
+      \${!amIn ? \`<button class="btn btn-primary btn-full mb-3" onclick="joinKK('\${data.id}')">Join the Draw</button>\` : '<p style="color:var(--success);text-align:center;margin-bottom:12px">✅ You\'re in!</p>'}
+      <p style="color:var(--muted);font-size:13px;text-align:center;margin-bottom:12px">\${data.participants?.length||0} participants joined</p>
+      \${data.participants?.length >= 2 ? \`<button class="btn btn-primary btn-full" onclick="doDraw('\${data.id}')">🎲 Do the Draw!</button>\` : '<p style="color:var(--muted);font-size:13px;text-align:center">Need at least 2 participants</p>'}
+    </div>\` : '<p style="color:var(--success);text-align:center;margin-bottom:12px">✅ Draw complete!</p>'}
+    <h3 style="margin-bottom:10px">Participants (\${data.participants?.length||0})</h3>
+    \${(data.participants||[]).map(p=>\`<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+      <div class="avatar avatar-sm" style="background:\${p.avatar_color||'#6366f1'}">\${initials(p.name)}</div>
+      <span>\${p.name}</span>
+      \${p.wish?\`<span style="color:var(--muted);font-size:13px;margin-left:auto">💭 \${p.wish}</span>\`:''}
+    </div>\`).join('')}
+  </div>\`;
+}
+async function createKK(year) {
+  const r = await api('/api/kk', {method:'POST', body:JSON.stringify({year, budget:50})});
+  if (r.error) { toast('❌ '+r.error); return; }
+  // Auto-join
+  await api('/api/kk/join', {method:'POST', body:JSON.stringify({draw_id:r.id})});
+  loadKK();
+}
+async function joinKK(drawId) {
+  const wish = prompt('Any gift wishes? (optional)');
+  await api('/api/kk/join', {method:'POST', body:JSON.stringify({draw_id:drawId, wish: wish||null})});
+  toast('Joined! 🎅'); loadKK();
+}
+async function doDraw(drawId) {
+  if (!confirm('Do the draw now? Everyone will get their assignment.')) return;
+  const r = await api('/api/kk/draw', {method:'POST', body:JSON.stringify({draw_id:drawId})});
+  if (r.error) { toast('❌ '+r.error); return; }
+  toast('🎅 Draw done! Check your assignment!'); loadKK();
 }
 
-async function createKKDraw() {
-  const year = parseInt(document.getElementById('kkYear').value);
-  const budget = parseFloat(document.getElementById('kkBudget').value) || null;
-  try {
-    await api('/api/kk', 'POST', { year, budget });
-    closeModal('kkModal');
-    loadKK();
-    toast('KK draw created! 🎄');
-  } catch (e) { toast(e.message); }
-}
-
-function openKKDrawModal(drawId) {
-  currentKKDrawId = drawId;
-  populateMemberPicker('kkParticipantPicker', allUsers.map(u => u.id));
-  // Pre-select all
-  document.querySelectorAll('#kkParticipantPicker .person-chip').forEach(el => el.classList.add('selected'));
-  openModal('kkDrawModal');
-}
-
-async function runKKDraw() {
-  const ids = getSelectedChips('kkParticipantPicker');
-  if (ids.length < 3) { toast('Need at least 3 people!'); return; }
-  try {
-    await api('/api/kk/' + currentKKDrawId + '/draw', 'POST', { participant_ids: ids });
-    closeModal('kkDrawModal');
-    loadKK();
-    toast('Names drawn! Check who you got 🎁');
-  } catch (e) { toast(e.message); }
-}
-
-// ── EXPENSES ───────────────────────────────────────────────────────────────
 async function loadExpenses() {
-  const listEl = document.getElementById('expenseList');
-  listEl.innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
-  try {
-    const expenses = await api('/api/expenses');
-    if (!expenses.length) {
-      listEl.innerHTML = '<div class="empty"><div class="empty-icon">💸</div><div class="empty-text">No shared expenses yet</div><div class="empty-sub">Track who owes who for presents, insurance, holidays...</div></div>';
-      return;
-    }
-    listEl.innerHTML = expenses.map(e => \`<div class="expense-item">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start">
-        <div>
-          <div class="expense-desc">\${esc(e.description)}</div>
-          <div class="expense-meta">Paid by \${esc(e.paid_by_name)} · \${categoryEmoji(e.category)} \${esc(e.category)}</div>
-        </div>
-        <div style="text-align:right">
-          <div class="expense-amount">€\${e.total_amount}</div>
-          \${e.i_owe > 0 ? '<div class="expense-owe">You owe €' + e.i_owe.toFixed(2) + '<button class="btn btn-sm" style="margin-left:8px;padding:4px 10px;font-size:11px" onclick="settleExpense(' + e.id + ')">Settled</button></div>' :
-            e.paid_by === me.id ? '' : '<div class="expense-settled">✓ You\'re settled</div>'}
-        </div>
+  const [expenses, summary] = await Promise.all([api('/api/expenses'), api('/api/expenses/summary')]);
+  const c = qs('#moreContent');
+  await loadUsersForSelects();
+  const owe = summary?.i_owe || 0;
+  const owed = summary?.owed_to_me || 0;
+  c.innerHTML = \`<div style="padding:12px">
+    <div style="display:flex;gap:10px;margin-bottom:16px">
+      <div style="flex:1;background:var(--surface);border-radius:12px;padding:14px;text-align:center">
+        <div class="text-xs text-muted" style="margin-bottom:4px">You owe</div>
+        <div class="amount-badge negative">€\${owe.toFixed(2)}</div>
       </div>
-    </div>\`).join('');
-  } catch (e) { listEl.innerHTML = '<div class="empty">' + e.message + '</div>'; }
+      <div style="flex:1;background:var(--surface);border-radius:12px;padding:14px;text-align:center">
+        <div class="text-xs text-muted" style="margin-bottom:4px">Owed to you</div>
+        <div class="amount-badge positive">€\${owed.toFixed(2)}</div>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3>Expenses</h3>
+      <button class="btn btn-sm btn-primary" onclick="openModal('newExpenseModal')">+ Add</button>
+    </div>
+    \${!expenses?.length ? '<p style="color:var(--muted)">No expenses yet</p>' : ''}
+    \${(expenses||[]).map(e=>\`<div class="expense-item">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-weight:600">\${e.description}</div>
+          <div style="font-size:12px;color:var(--muted)">\${e.paid_by_name} · \${timeAgo(e.created_at)}</div>
+        </div>
+        <div style="font-weight:700">€\${parseFloat(e.amount).toFixed(2)}</div>
+      </div>
+      \${e.splits?.filter(s=>s.user_id===currentUser?.id&&!s.settled&&e.paid_by!==currentUser?.id).length?
+        \`<button class="btn btn-sm btn-ghost mt-2" onclick="settleExpense('\${e.id}')">Mark as paid</button>\`:''}
+    </div>\`).join('')}
+  </div>\`;
 }
-
-function populateSplitPicker() {
-  const el = document.getElementById('expenseSplitPicker');
-  el.innerHTML = allUsers.filter(u => u.id !== me.id).map(u =>
-    \`<span class="person-chip" data-id="\${u.id}" onclick="toggleChip(this)">\${esc(u.name)}</span>\`
-  ).join('');
-}
-
-async function submitExpense() {
-  const description = document.getElementById('expenseDesc').value.trim();
-  const total_amount = parseFloat(document.getElementById('expenseAmount').value);
-  const category = document.getElementById('expenseCategory').value;
-  const split_with = getSelectedChips('expenseSplitPicker');
-  if (!description || !total_amount) { toast('Fill in description and amount'); return; }
-  try {
-    await api('/api/expenses', 'POST', { description, total_amount, category, split_with });
-    closeModal('addExpenseModal');
-    document.getElementById('expenseDesc').value = '';
-    document.getElementById('expenseAmount').value = '';
-    loadExpenses();
-    toast('Expense added 💸');
-  } catch (e) { toast(e.message); }
-}
-
 async function settleExpense(id) {
-  await api('/api/expenses/' + id + '/settle', 'POST');
-  loadExpenses();
-  toast('Settled! ✓');
+  await api('/api/expenses/'+id+'/settle', {method:'POST'});
+  toast('Marked as paid ✅'); loadExpenses();
+}
+function updateExpSplits() {} // placeholder
+async function submitExpense() {
+  const desc = qs('#expDesc').value.trim();
+  const amount = parseFloat(qs('#expAmount').value);
+  if (!desc || !amount) { toast('Fill in description and amount'); return; }
+  const selected = Array.from(document.querySelectorAll('#expSplitUsers input:checked')).map(i=>i.value);
+  const everyone = [currentUser.id, ...selected];
+  const split = amount / everyone.length;
+  const splits = everyone.map(uid=>({user_id:uid, amount:parseFloat(split.toFixed(2))}));
+  const r = await api('/api/expenses', {method:'POST', body:JSON.stringify({description:desc, amount, splits})});
+  if (r.error) { toast('❌ '+r.error); return; }
+  closeModal('newExpenseModal'); toast('Expense added! 💸'); loadExpenses();
 }
 
-// ── PROFILE ────────────────────────────────────────────────────────────────
-function showProfile() {
-  toast('Profile editing coming soon!');
+async function loadTransfers() {
+  const [transfers, balance] = await Promise.all([api('/api/transfers'), api('/api/transfers/balance')]);
+  await loadUsersForSelects();
+  const c = qs('#moreContent');
+  c.innerHTML = \`<div style="padding:12px">
+    \${balance?.balances?.length ? \`<div style="margin-bottom:16px">
+      <h3 style="margin-bottom:8px">Net Balances</h3>
+      \${balance.balances.filter(b=>Math.abs(b.net)>0.01).map(b=>\`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)">
+        <span>\${b.other_name}</span>
+        <span class="amount-badge \${b.net>0?'positive':'negative'}">\${b.net>0?'+':b.net<0?'-':''}€${Math.abs(b.net).toFixed(2)}</span>
+      </div>\`).join('')}
+    </div>\` : ''}
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3>Transfers</h3>
+      <button class="btn btn-sm btn-primary" onclick="openModal('newTransferModal')">+ Request</button>
+    </div>
+    \${!transfers?.length ? '<p style="color:var(--muted)">No transfers yet</p>' : ''}
+    \${(transfers||[]).map(t=>{
+      const isTo = t.to_user_id===currentUser?.id;
+      const isPending = t.status==='pending';
+      return \`<div class="transfer-item">
+        <div class="avatar avatar-sm" style="background:\${isTo?t.from_color||'#6366f1':t.to_color||'#6366f1'}">\${initials(isTo?t.from_name:t.to_name)}</div>
+        <div style="flex:1">
+          <div style="font-weight:600">\${isTo?'From '+t.from_name:'To '+t.to_name}</div>
+          <div style="font-size:13px;color:var(--muted)">\${t.note||''} · \${timeAgo(t.created_at)}</div>
+        </div>
+        <div>
+          <div class="amount-badge \${isTo?'positive':'negative'}" style="display:block;text-align:right">\${isTo?'+':'-'}€\${parseFloat(t.amount).toFixed(2)}</div>
+          <div style="font-size:12px;color:var(--muted);text-align:right">\${t.status}</div>
+        </div>
+        \${isPending&&isTo?\`<div style="display:flex;gap:6px">
+          <button class="btn btn-sm btn-primary" onclick="actionTransfer('\${t.id}','confirm')">✅</button>
+          <button class="btn btn-sm btn-danger" onclick="actionTransfer('\${t.id}','reject')">❌</button>
+        </div>\`:''}
+      </div>\`;
+    }).join('')}
+  </div>\`;
+}
+async function createTransfer() {
+  const to = qs('#transferTo').value;
+  const amount = parseFloat(qs('#transferAmount').value);
+  const note = qs('#transferNote').value;
+  if (!to || !amount) { toast('Fill in all fields'); return; }
+  const r = await api('/api/transfers', {method:'POST', body:JSON.stringify({to_user_id:to, amount, note})});
+  if (r.error) { toast('❌ '+r.error); return; }
+  closeModal('newTransferModal'); toast('Transfer request sent! 💳'); loadTransfers();
+}
+async function actionTransfer(id, action) {
+  const r = await api('/api/transfers/'+id+'/'+action, {method:'POST'});
+  if (r.error) { toast('❌ '+r.error); return; }
+  toast(action==='confirm'?'Confirmed! ✅':'Rejected'); loadTransfers();
 }
 
-// ── HELPERS ────────────────────────────────────────────────────────────────
-function esc(s) {
-  if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+async function loadVault() {
+  const docs = await api('/api/documents');
+  const c = qs('#moreContent');
+  const typeIcon = {id:'🪪', insurance:'🛡️', medical:'🏥', finance:'💰', other:'📄'};
+  c.innerHTML = \`<div style="padding:12px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div>
+        <h3>Document Vault</h3>
+        <p style="font-size:12px;color:var(--muted)">Files are encrypted end-to-end</p>
+      </div>
+      <button class="btn btn-sm btn-primary" onclick="openModal('uploadDocModal')">+ Upload</button>
+    </div>
+    \${!docs?.length ? '<div class="empty-state"><div class="icon">🔐</div><p>No documents yet</p></div>' : ''}
+    \${(docs||[]).map(d=>\`<div class="doc-item" onclick="downloadDoc('\${d.id}','\${d.name}')">
+      <div class="doc-icon">\${typeIcon[d.doc_type]||'📄'}</div>
+      <div style="flex:1">
+        <div style="font-weight:600">\${d.name}</div>
+        <div style="font-size:12px;color:var(--muted)">\${d.owner_name||'You'} · \${(d.size_bytes/1024).toFixed(1)}KB</div>
+      </div>
+      <span style="font-size:20px;color:var(--muted)">⬇</span>
+    </div>\`).join('')}
+  </div>\`;
+}
+async function downloadDoc(id, name) {
+  const headers = {};
+  if (session?.token) headers['x-session-token'] = session.token;
+  const r = await fetch('/api/documents/'+id+'/download', {headers});
+  if (!r.ok) { toast('Error downloading'); return; }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.click();
+  URL.revokeObjectURL(url);
+}
+async function uploadDoc() {
+  const name = qs('#docName').value.trim();
+  const file = qs('#docFile').files[0];
+  if (!file) { toast('Pick a file'); return; }
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('name', name || file.name);
+  fd.append('doc_type', qs('#docType').value);
+  fd.append('shared', qs('#docShared').checked?'1':'0');
+  const r = await apiForm('/api/documents/upload', fd);
+  if (r.error) { toast('❌ '+r.error); return; }
+  closeModal('uploadDocModal'); toast('Uploaded & encrypted! 🔐'); loadVault();
 }
 
-function timeAgo(ts) {
-  if (!ts) return '';
-  const d = new Date(ts + (ts.includes('Z') || ts.includes('+') ? '' : 'Z'));
-  const diff = (Date.now() - d) / 1000;
-  if (diff < 60) return 'just now';
-  if (diff < 3600) return Math.floor(diff/60) + 'm ago';
-  if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
-  if (diff < 604800) return Math.floor(diff/86400) + 'd ago';
-  return d.toLocaleDateString('en-IE', { day: 'numeric', month: 'short' });
+// ─── PROFILE ────────────────────────────────────────────────────────────────────
+async function loadProfile() {
+  const notifs = await api('/api/notifications');
+  const c = qs('#profileContent');
+  c.innerHTML = \`<div style="display:flex;flex-direction:column;align-items:center;margin-bottom:24px;gap:12px">
+    <div class="avatar avatar-lg" style="background:\${currentUser?.avatar_color||'#6366f1'}">\${initials(currentUser?.name||'')}</div>
+    <div style="text-align:center">
+      <h2>\${currentUser?.name}</h2>
+      <p style="color:var(--muted);font-size:14px">\${currentUser?.role||''}</p>
+    </div>
+  </div>
+  <div style="margin-bottom:24px">
+    <h3 style="margin-bottom:10px">Notifications \${notifs?.unread?'('+notifs.unread+' new)':''}</h3>
+    \${notifs?.unread ? '<button class="btn btn-ghost btn-sm" onclick="markAllRead()" style="margin-bottom:8px">Mark all read</button>' : ''}
+    \${!notifs?.items?.length ? '<p style="color:var(--muted)">All caught up!</p>' : ''}
+    \${(notifs?.items||[]).slice(0,10).map(n=>\`<div style="padding:10px 0;border-bottom:1px solid var(--border);\${!n.read?'opacity:1':'opacity:.6'}">
+      <div style="font-weight:\${!n.read?'600':'400'};font-size:14px">\${n.title}</div>
+      <div style="font-size:13px;color:var(--muted)">\${n.body} · \${timeAgo(n.created_at)}</div>
+    </div>\`).join('')}
+  </div>
+  <button class="btn btn-ghost btn-full" onclick="logout()">Log Out</button>\`;
 }
-
-function formatDate(d) {
-  if (!d) return '';
-  const parts = d.split('-');
-  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  return (parts[2] ? parts[2] + ' ' : '') + months[parseInt(parts[1])-1] + (parts[0] && parts[0] !== '0000' ? ' ' + parts[0] : '');
+async function markAllRead() {
+  await api('/api/notifications/read-all', {method:'POST'});
+  qs('#notifBadge').style.display='none';
+  loadProfile();
 }
-
-function nextBirthday(dateStr) {
-  if (!dateStr) return null;
-  const parts = dateStr.split('-');
-  const now = new Date(); now.setHours(0,0,0,0);
-  let bd = new Date(now.getFullYear(), parseInt(parts[1])-1, parseInt(parts[2] || 1));
-  if (bd < now) bd.setFullYear(bd.getFullYear() + 1);
-  return bd;
+async function pollNotifs() {
+  const r = await api('/api/notifications');
+  const badge = qs('#notifBadge');
+  if (r?.unread > 0) { badge.textContent=r.unread; badge.style.display='block'; }
+  else badge.style.display='none';
 }
-
-function categoryEmoji(cat) {
-  return { presents: '🎁', insurance: '🛡️', holiday: '✈️', food: '🍽️', general: '📋' }[cat] || '📋';
+function logout() {
+  api('/api/auth/logout', {method:'POST'});
+  session=null; localStorage.removeItem('fh_session');
+  location.reload();
 }
-
-// ── GO ─────────────────────────────────────────────────────────────────────
-boot();
 </script>
 </body>
 </html>`;
 }
+
+
+
+// ─── MAIN ROUTER ──────────────────────────────────────────────────────────────
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    // CORS preflight
+    if (method === 'OPTIONS') {
+      return new Response(null, {headers:{
+        'access-control-allow-origin':'*',
+        'access-control-allow-methods':'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+        'access-control-allow-headers':'content-type,x-session-token',
+        'access-control-max-age':'86400'
+      }});
+    }
+
+    // Serve SPA
+    if (path === '/' || path === '/index.html' || (!path.startsWith('/api/'))) {
+      return new Response(getSPA(), {headers:{'content-type':'text/html;charset=utf-8','x-robots-tag':'noindex'}});
+    }
+
+    // Auth routes (no session needed)
+    const authRoutes = ['/api/auth/invite','/api/auth/register','/api/auth/login'];
+    if (authRoutes.includes(path)) {
+      const r = await handleAuth(path, request, env);
+      if (r) return r;
+    }
+
+    // Photo proxy (requires session)
+    if (path.startsWith('/api/photos/')) {
+      const user = await getSession(request, env);
+      if (!user) return err('Unauth', 401);
+      const r = await handlePhotos(path, request, env, user);
+      if (r) return r;
+    }
+
+    // All other API routes need auth
+    const user = await getSession(request, env);
+    if (!user) return err('Unauthorized', 401);
+
+    // Auth profile routes
+    const r0 = await handleAuth(path, request, env);
+    if (r0) return r0;
+
+    // Posts
+    if (path.startsWith('/api/posts')) {
+      const r = await handlePosts(path, request, env, user);
+      if (r) return r;
+    }
+
+    // Users list
+    if (path === '/api/users') {
+      const r = await handleChats(path, request, env, user);
+      if (r) return r;
+    }
+
+    // Chats
+    if (path.startsWith('/api/chats')) {
+      const r = await handleChats(path, request, env, user);
+      if (r) return r;
+    }
+
+    // Stories
+    if (path.startsWith('/api/stories')) {
+      const r = await handleStories(path, request, env, user);
+      if (r) return r;
+    }
+
+    // Events
+    if (path.startsWith('/api/events')) {
+      const r = await handleEvents(path, request, env, user);
+      if (r) return r;
+    }
+
+    // Transfers
+    if (path.startsWith('/api/transfers')) {
+      const r = await handleTransfers(path, request, env, user);
+      if (r) return r;
+    }
+
+    // Notifications
+    if (path.startsWith('/api/notifications')) {
+      const r = await handleNotifications(path, request, env, user);
+      if (r) return r;
+    }
+
+    // Documents
+    if (path.startsWith('/api/documents')) {
+      const r = await handleDocuments(path, request, env, user);
+      if (r) return r;
+    }
+
+    // Birthdays
+    if (path.startsWith('/api/birthdays')) {
+      const r = await handleBirthdays(path, request, env, user);
+      if (r) return r;
+    }
+
+    // Gifts
+    if (path.startsWith('/api/gifts')) {
+      const r = await handleGifts(path, request, env, user);
+      if (r) return r;
+    }
+
+    // KK Draw
+    if (path.startsWith('/api/kk')) {
+      const r = await handleKK(path, request, env, user);
+      if (r) return r;
+    }
+
+    // Expenses
+    if (path.startsWith('/api/expenses')) {
+      const r = await handleExpenses(path, request, env, user);
+      if (r) return r;
+    }
+
+    return err('Not found', 404);
+  }
+};
