@@ -1,11 +1,11 @@
 # Family Hub — RESUME-HERE
 Last updated: 2026-05-01
 
-## Status: v2 deployed ✅ — awaiting family onboarding
+## Status: v2 LIVE ✅ — registration working, awaiting family onboarding
 
 **Live URL:** https://family-hub.pgallivan.workers.dev  
 **Repo:** https://github.com/PaddyGallivan/family-hub  
-**Asgard row:** id 53, progress 80%
+**Asgard row:** id 53, progress 85%
 
 ---
 
@@ -31,11 +31,17 @@ Last updated: 2026-05-01
 
 ## Infrastructure
 
-- **Worker:** `family-hub` on Cloudflare (account: Luck Dragon Main)
+- **Worker:** `family-hub` on Cloudflare (account: Luck Dragon Main, `a6f47c17811ee2f8b6caeb8f38768c20`)
 - **D1:** `family-hub` — UUID `abcbe15d-9a98-4e01-82eb-c82a0acd1443`
 - **R2:** `family-hub-photos` (photos + encrypted docs)
 - **Secrets on worker:** `ENCRYPTION_KEY`, `APP_SECRET`
-- **Worker size:** ~116 KB, 2321 lines
+- **Worker size:** ~117 KB, single-file SPA
+
+## Schema notes (post-migration 2026-05-01)
+All user_id columns are now TEXT (UUID-compatible). Tables recreated cleanly:
+- `users.id TEXT PRIMARY KEY` (was INTEGER — fixed)
+- `sessions.token TEXT PRIMARY KEY` (was `id` — renamed)
+- All dependent tables (messages, posts, events, etc.) use `TEXT` user_id
 
 ## Deploy command (Python urllib multipart)
 ```python
@@ -48,9 +54,8 @@ metadata = {
   "keep_bindings": ["secret_text","plain_text","kv_namespace","d1","service","r2_bucket"],
   "compatibility_date": "2024-01-01"
 }
-# PUT https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/workers/scripts/family-hub
-# Auth: Bearer [stored in asgard-vault: CF_API_TOKEN_FULLOPS]
-# (refresh from vault: asgard-vault.pgallivan.workers.dev/secret/CF_API_TOKEN_FULLOPS — PIN 535554)
+# PUT https://api.cloudflare.com/client/v4/accounts/a6f47c17811ee2f8b6caeb8f38768c20/workers/scripts/family-hub
+# Auth: Bearer [stored in asgard-vault: CF_API_TOKEN_FULLOPS — PIN from Mona]
 ```
 
 ---
@@ -62,7 +67,7 @@ All 14 members seeded. Invite links are in:
 
 | Name | Role | Token |
 |------|------|-------|
-| Mona | you | f1c4b46491466b382f5e5a6411289188 |
+| Mona | you | f1c4b46491466b382f5e5a6411289188 (USED — registered) |
 | Jacky | Partner | 55d8228c1863df7e557316e1b73da21c |
 | Kelly | Sister | a9f4ecb68b4b1e45ee7f3c77685b7c51 |
 | Mary | Sister | 5d23619f644ef821dd0ea4bf562b6102 |
@@ -82,8 +87,12 @@ All 14 members seeded. Invite links are in:
 ## Next actions
 
 1. **Send invite links to family** — WhatsApp each person their link from the invite doc
-2. **Test end-to-end:**
-   - Register via invite → group chat visible → post to feed → story → event → KK draw
+2. **After everyone registers:** run the group chat SQL fix:
+   ```sql
+   INSERT OR IGNORE INTO chat_members (chat_id,user_id) 
+   SELECT 1, id FROM users WHERE password_hash IS NOT NULL AND id NOT IN 
+   (SELECT user_id FROM chat_members WHERE chat_id=1)
+   ```
 3. **Nice-to-haves (not built yet):**
    - Push notifications (Web Push API)
    - Avatar photo upload
@@ -92,6 +101,5 @@ All 14 members seeded. Invite links are in:
 
 ---
 
-## Known schema notes
-- Users table has both integer IDs (v1 placeholders) and UUID IDs (anyone who registers via invite gets a UUID). Integer rows become orphans after registration — can be cleaned up with `DELETE FROM users WHERE id < 100 AND password_hash IS NULL` after everyone's registered.
-- Group chat (id=1) currently has the integer-ID placeholder members. After everyone registers via invite, run: `INSERT OR IGNORE INTO chat_members (chat_id,user_id) SELECT 1, id FROM users WHERE password_hash IS NOT NULL`
+## Verified working (2026-05-01)
+- ✅ Registration via invi
