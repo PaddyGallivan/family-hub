@@ -2261,25 +2261,81 @@ async function uploadDoc() {
 
 // ─── PROFILE ────────────────────────────────────────────────────────────────────
 async function loadProfile() {
-  const notifs = await api('/api/notifications');
+  const [notifs, families] = await Promise.all([api('/api/notifications'), api('/api/families')]);
+  const fam = (families||[])[0];
   const c = qs('#profileContent');
-  c.innerHTML = \`<div style="display:flex;flex-direction:column;align-items:center;margin-bottom:24px;gap:12px">
-    <div class="avatar avatar-lg" style="background:\${currentUser?.avatar_color||'#6366f1'}">\${initials(currentUser?.name||'')}</div>
-    <div style="text-align:center">
-      <h2>\${currentUser?.name}</h2>
-      <p style="color:var(--muted);font-size:14px">\${currentUser?.role||''}</p>
+  const avatarHtml = currentUser?.avatar_url
+    ? \`<img src="\${currentUser.avatar_url}" style="width:80px;height:80px;border-radius:50%;object-fit:cover">\`
+    : \`<div class="avatar avatar-lg" style="background:\${currentUser?.avatar_color||'#6366f1'}">\${initials(currentUser?.name||'')}</div>\`;
+  c.innerHTML = \`
+    <div style="display:flex;flex-direction:column;align-items:center;margin-bottom:20px;gap:10px">
+      <div style="position:relative;cursor:pointer" onclick="qs('#avatarFileInput').click()">
+        \${avatarHtml}
+        <div style="position:absolute;bottom:0;right:0;background:var(--primary);border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:14px">✏️</div>
+      </div>
+      <input type="file" id="avatarFileInput" accept="image/*" style="display:none" onchange="uploadAvatar(this)">
+      <div style="text-align:center">
+        <h2>\${esc(currentUser?.name||'')}</h2>
+        <p style="color:var(--muted);font-size:13px">\${esc(currentUser?.role||'')}\${fam?' · '+esc(fam.name):''}</p>
+      </div>
     </div>
-  </div>
-  <div style="margin-bottom:24px">
-    <h3 style="margin-bottom:10px">Notifications \${notifs?.unread?'('+notifs.unread+' new)':''}</h3>
-    \${notifs?.unread ? '<button class="btn btn-ghost btn-sm" onclick="markAllRead()" style="margin-bottom:8px">Mark all read</button>' : ''}
-    \${!notifs?.items?.length ? '<p style="color:var(--muted)">All caught up!</p>' : ''}
-    \${(notifs?.items||[]).slice(0,10).map(n=>\`<div style="padding:10px 0;border-bottom:1px solid var(--border);\${!n.read?'opacity:1':'opacity:.6'}">
-      <div style="font-weight:\${!n.read?'600':'400'};font-size:14px">\${n.title}</div>
-      <div style="font-size:13px;color:var(--muted)">\${n.body} · \${timeAgo(n.created_at)}</div>
-    </div>\`).join('')}
-  </div>
-  <button class="btn btn-ghost btn-full" onclick="logout()">Log Out</button>\`;
+
+    <div style="background:var(--surface2);border-radius:12px;padding:16px;margin-bottom:14px">
+      <h3 style="margin-bottom:12px;font-size:15px">✏️ Edit Profile</h3>
+      <div class="input-group"><label>Display Name</label><input type="text" id="editName" value="\${esc(currentUser?.name||'')}" placeholder="Your name"></div>
+      <div class="input-group"><label>Bio</label><input type="text" id="editBio" value="\${esc(currentUser?.bio||'')}" placeholder="Something about you..."></div>
+      <button class="btn btn-primary btn-full" onclick="saveProfile()">Save Changes</button>
+    </div>
+
+    <div style="background:var(--surface2);border-radius:12px;padding:16px;margin-bottom:14px">
+      <h3 style="margin-bottom:12px;font-size:15px">🔒 Change Password</h3>
+      <div class="input-group"><label>New Password</label><input type="password" id="newPwd" placeholder="Min 6 characters"></div>
+      <div class="input-group"><label>Confirm</label><input type="password" id="confirmPwd" placeholder="Confirm new password"></div>
+      <button class="btn btn-primary btn-full" onclick="changePassword()">Change Password</button>
+    </div>
+
+    \${fam ? \`<div style="background:var(--surface2);border-radius:12px;padding:16px;margin-bottom:14px">
+      <h3 style="margin-bottom:4px;font-size:15px">🏠 \${esc(fam.name)}</h3>
+      <p style="color:var(--muted);font-size:13px;margin-bottom:10px">Invite code: <strong style="font-size:16px;letter-spacing:2px">\${fam.invite_code||''}</strong></p>
+      <button class="btn btn-ghost btn-sm" onclick="openFamilySettings()">⚙️ Family Settings</button>
+    </div>\` : ''}
+
+    <div style="background:var(--surface2);border-radius:12px;padding:16px;margin-bottom:14px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <h3 style="font-size:15px;margin:0">🔔 Notifications \${notifs?.unread?\`<span style="background:var(--primary);color:white;border-radius:12px;padding:1px 7px;font-size:11px">\${notifs.unread}</span>\`:''}</h3>
+        \${notifs?.unread ? '<button class="btn btn-ghost btn-sm" onclick="markAllRead()">Mark read</button>' : ''}
+      </div>
+      \${!notifs?.items?.length ? '<p style="color:var(--muted);font-size:13px">All caught up! 🎉</p>' : ''}
+      \${(notifs?.items||[]).slice(0,8).map(n=>\`<div style="padding:8px 0;border-bottom:1px solid var(--border);opacity:\${n.read?'.5':'1'}">
+        <div style="font-weight:\${!n.read?'600':'400'};font-size:13px">\${esc(n.title)}</div>
+        <div style="font-size:12px;color:var(--muted)">\${esc(n.body)} · \${timeAgo(n.created_at)}</div>
+      </div>\`).join('')}
+    </div>
+
+    <button class="btn btn-ghost btn-full" onclick="logout()" style="color:#ef4444;margin-top:4px">Log Out</button>
+  \`;
+}
+async function saveProfile() {
+  const name = qs('#editName')?.value.trim();
+  const bio = qs('#editBio')?.value.trim();
+  if (!name) { toast('Name cannot be empty'); return; }
+  const r = await api('/api/auth/profile', {method:'PATCH', body:JSON.stringify({name, bio:bio||null})});
+  if (r?.error) { toast('❌ '+r.error); return; }
+  currentUser = {...currentUser, name, bio};
+  if (session) { session.user = currentUser; localStorage.setItem('fh_session', JSON.stringify(session)); }
+  toast('Profile saved! ✅');
+  loadProfile();
+}
+async function changePassword() {
+  const pwd = qs('#newPwd')?.value;
+  const conf = qs('#confirmPwd')?.value;
+  if (!pwd || pwd.length < 6) { toast('Password must be at least 6 characters'); return; }
+  if (pwd !== conf) { toast('Passwords do not match'); return; }
+  const r = await api('/api/auth/profile', {method:'PATCH', body:JSON.stringify({password: pwd})});
+  if (r?.error) { toast('❌ '+r.error); return; }
+  if (qs('#newPwd')) qs('#newPwd').value = '';
+  if (qs('#confirmPwd')) qs('#confirmPwd').value = '';
+  toast('Password changed! 🔒');
 }
 async function markAllRead() {
   await api('/api/notifications/read-all', {method:'POST'});
