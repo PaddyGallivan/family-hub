@@ -915,7 +915,12 @@ function getSPA() {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#4f46e5">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Family Hub">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#6366f1">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon.svg">
 <title>Family Hub 🏠</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
@@ -3122,7 +3127,38 @@ export default {
 
     // Serve SPA
     if (path === '/' || path === '/index.html' || (!path.startsWith('/api/'))) {
-      return new Response(getSPA(), {headers:{'content-type':'text/html;charset=utf-8','x-robots-tag':'noindex'}});
+      // PWA manifest
+      if (url.pathname === '/manifest.json') {
+        const manifest = {
+          name: 'Family Hub',
+          short_name: 'Family Hub',
+          description: 'Your private family app',
+          start_url: '/',
+          display: 'standalone',
+          orientation: 'portrait',
+          background_color: '#0f172a',
+          theme_color: '#6366f1',
+          icons: [
+            {src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable'},
+            {src: '/icon.svg', sizes: '192x192', type: 'image/svg+xml'},
+            {src: '/icon.svg', sizes: '512x512', type: 'image/svg+xml'}
+          ]
+        };
+        return new Response(JSON.stringify(manifest), {
+          headers: {'content-type': 'application/manifest+json', 'cache-control': 'public,max-age=86400'}
+        });
+      }
+      // PWA icon
+      if (url.pathname === '/icon.svg') {
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="114" fill="#6366f1"/>
+  <text x="256" y="340" font-size="260" text-anchor="middle" font-family="-apple-system,sans-serif">🏠</text>
+</svg>`;
+        return new Response(svg, {
+          headers: {'content-type': 'image/svg+xml', 'cache-control': 'public,max-age=86400'}
+        });
+      }
+            return new Response(getSPA(), {headers:{'content-type':'text/html;charset=utf-8','x-robots-tag':'noindex'}});
     }
 
     // Auth routes (no session needed)
