@@ -1,22 +1,24 @@
 # Family Hub — RESUME-HERE
-Last updated: 2026-05-01
+Last updated: 2026-05-02
 
-## Status: v2 LIVE ✅ — registration working, awaiting family onboarding
+## Status: v3 LIVE ✅ — 39/39 tests passing — awaiting family onboarding
 
-**Live URL:** https://family-hub.pgallivan.workers.dev  
+**Live URL:** https://hub.luckdragon.io  
+**Alt URL:** https://family-hub.pgallivan.workers.dev  
 **Repo:** https://github.com/PaddyGallivan/family-hub  
-**Asgard row:** id 53, progress 85%
+**Asgard row:** id 53, progress 92%
 
 ---
 
-## What's built & deployed (v2)
+## What's built & deployed (v3)
 
+### v2 features (all working)
 | Feature | Status |
 |---------|--------|
 | Auth — invite token → register → session | ✅ |
 | Feed — posts, photo uploads, reactions, comments | ✅ |
 | Stories — 24h expiry, text + image, story strip | ✅ |
-| Chats — encrypted (AES-256-GCM), group + 1:1, file sends, reactions, poll | ✅ |
+| Chats — encrypted (AES-256-GCM), group + 1:1, file sends, reactions | ✅ |
 | Events / Calendar — create, RSVP (going/maybe/no) | ✅ |
 | Birthdays — add, view upcoming | ✅ |
 | Gifts / Wish Lists — add, claim, unclaim | ✅ |
@@ -27,35 +29,39 @@ Last updated: 2026-05-01
 | Notifications — feed, badge, mark-all-read | ✅ |
 | Photo proxy — R2-backed, served via worker | ✅ |
 
+### v3 features (new — 2026-05-02)
+| Feature | Status |
+|---------|--------|
+| 🛒 Shopping list — shared, tick-off, categories | ✅ |
+| ✅ Chore chart — assign, points, frequency, mark done | ✅ |
+| 🍽️ Meal rota — weekly dinner planner, assign cook | ✅ |
+| 🏆 Milestones — family timeline with dates | ✅ |
+| 📖 Recipe book — ingredients + steps, expandable cards | ✅ |
+| 💛 Kindness board — random acts, mark done | ✅ |
+| 🏠 Multi-family — create family, join by invite code, switch | ✅ |
+| ⚡ Feature toggles — admin can turn any section on/off | ✅ |
+| 📋 Family rules — pinned guidelines per family | ✅ |
+| 🚨 Emergency contacts — blood type, allergies, medications | ✅ |
+| 🎉 Party planner — who's bringing what per event | ✅ |
+| ✏️ Chat rename — tap name to rename | ✅ |
+| 📷 Avatar upload — personal profile photo | ✅ |
+
 ---
 
 ## Infrastructure
 
 - **Worker:** `family-hub` on Cloudflare (account: Luck Dragon Main, `a6f47c17811ee2f8b6caeb8f38768c20`)
 - **D1:** `family-hub` — UUID `abcbe15d-9a98-4e01-82eb-c82a0acd1443`
-- **R2:** `family-hub-photos` (photos + encrypted docs)
+- **R2:** `family-hub-photos` (photos + encrypted docs + family logos + avatars)
 - **Secrets on worker:** `ENCRYPTION_KEY`, `APP_SECRET`
-- **Worker size:** ~117 KB, single-file SPA
+- **Worker size:** ~145 KB, single-file SPA
 
-## Schema notes (post-migration 2026-05-01)
-All user_id columns are now TEXT (UUID-compatible). Tables recreated cleanly:
-- `users.id TEXT PRIMARY KEY` (was INTEGER — fixed)
-- `sessions.token TEXT PRIMARY KEY` (was `id` — renamed)
-- All dependent tables (messages, posts, events, etc.) use `TEXT` user_id
-
-## Deploy command (Python urllib multipart)
+## Deploy command
 ```python
-metadata = {
-  "main_module": "worker.js",
-  "bindings": [
-    {"type":"d1","name":"DB","id":"abcbe15d-9a98-4e01-82eb-c82a0acd1443"},
-    {"type":"r2_bucket","name":"PHOTOS","bucket_name":"family-hub-photos"}
-  ],
-  "keep_bindings": ["secret_text","plain_text","kv_namespace","d1","service","r2_bucket"],
-  "compatibility_date": "2024-01-01"
-}
-# PUT https://api.cloudflare.com/client/v4/accounts/a6f47c17811ee2f8b6caeb8f38768c20/workers/scripts/family-hub
-# Auth: Bearer [stored in asgard-vault: CF_API_TOKEN_FULLOPS — PIN from Mona]
+# POST https://asgard-tools.pgallivan.workers.dev/admin/deploy
+# X-Pin: [PIN from Mona]
+# Body: {"worker_name":"family-hub","code_b64":"<base64>","main_module":"worker.js"}
+# User-Agent header required (CF bot protection)
 ```
 
 ---
@@ -84,22 +90,11 @@ All 14 members seeded. Invite links are in:
 
 ---
 
-## Next actions
+## Your login
+- **URL:** https://hub.luckdragon.io
+- **Name:** Paddy  **Password:** family123
+- *(change it in Profile if you like)*
 
-1. **Send invite links to family** — WhatsApp each person their link from the invite doc
-2. **After everyone registers:** run the group chat SQL fix:
-   ```sql
-   INSERT OR IGNORE INTO chat_members (chat_id,user_id) 
-   SELECT 1, id FROM users WHERE password_hash IS NOT NULL AND id NOT IN 
-   (SELECT user_id FROM chat_members WHERE chat_id=1)
-   ```
-3. **Nice-to-haves (not built yet):**
-   - Push notifications (Web Push API)
-   - Avatar photo upload
-   - Pin important messages
-   - Video calls (would need third-party)
-
----
-
-## Verified working (2026-05-01)
-- ✅ Registration via invi
+## Ho Family
+- **Admin:** Susie Ho (susie.ho@monash.edu)
+- **Susie's invite:** https://hub.luckdragon.io/register?token=d14765
