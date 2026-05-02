@@ -1024,6 +1024,17 @@ textarea{resize:vertical;min-height:80px}
 .react-picker span:hover{transform:scale(1.3)}
 .post-action{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;padding:8px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--muted);transition:all .15s}
 .post-action:hover{background:var(--surface2);color:var(--text)}
+.comment-sheet{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;justify-content:flex-end;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .25s}
+.comment-sheet.open{opacity:1;pointer-events:all}
+.comment-sheet-inner{background:var(--surface);border-radius:20px 20px 0 0;display:flex;flex-direction:column;max-height:85vh;transform:translateY(100%);transition:transform .3s cubic-bezier(.32,.72,0,1)}
+.comment-sheet.open .comment-sheet-inner{transform:translateY(0)}
+.comment-list{flex:1;overflow-y:auto;padding:12px 16px}
+.comment-bubble{display:flex;gap:10px;margin-bottom:14px}
+.comment-bubble-body{background:var(--surface2);border-radius:0 12px 12px 12px;padding:8px 12px;flex:1}
+.comment-bubble-name{font-size:12px;font-weight:700;color:var(--primary);margin-bottom:2px}
+.comment-bubble-text{font-size:14px;line-height:1.4}
+.comment-bubble-time{font-size:11px;color:var(--muted);margin-top:2px}
+.comment-input-row{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border);background:var(--surface)}
 .post-action.liked{color:#ef4444}
 /* PILLS / TABS */
 .tabs{display:flex;gap:6px;padding:12px 16px 0;overflow-x:auto;scrollbar-width:none}
@@ -1349,6 +1360,22 @@ textarea{resize:vertical;min-height:80px}
   </div>
 
   <!-- MODALS -->
+  <!-- COMMENT SHEET -->
+  <div class="comment-sheet" id="commentSheet" onclick="closeCommentSheet(event)">
+    <div class="comment-sheet-inner">
+      <div style="text-align:center;padding:10px 16px 0"><div style="width:40px;height:4px;background:var(--border);border-radius:2px;display:inline-block"></div></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 16px">
+        <h3 id="commentSheetTitle" style="font-size:16px;font-weight:700;margin:0">Comments</h3>
+        <button onclick="closeCommentSheet()" style="background:none;border:none;color:var(--muted);font-size:24px;cursor:pointer;line-height:1;padding:4px">&#215;</button>
+      </div>
+      <div class="comment-list" id="commentList"></div>
+      <div class="comment-input-row">
+        <input type="text" id="commentInput" placeholder="Add a comment..." style="flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:10px 14px;color:var(--text);font-size:14px" onkeydown="if(event.key==='Enter')submitComment()">
+        <button class="btn btn-primary" onclick="submitComment()" style="border-radius:20px;padding:10px 18px;min-width:auto">Send</button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-overlay" id="newPostModal" onclick="handleOverlayClick(event,'newPostModal')">
     <div class="modal">
       <div class="modal-handle"></div>
@@ -1796,11 +1823,19 @@ async function postStory() {
 }
 
 // ─── FEED ────────────────────────────────────────────────────────────────────
-async function loadFeed() {
+let _feedOffset = 0, _feedLoading = false, _feedDone = false;
+
+async function loadFeed(append=false) {
+  if (append && (_feedLoading || _feedDone)) return;
+  if (!append) { _feedOffset = 0; _feedDone = false; }
+  _feedLoading = true;
   const [posts, events] = await Promise.all([
-    api('/api/posts?limit=20'),
-    api('/api/events')
+    api('/api/posts?limit=20&offset=' + _feedOffset),
+    append ? Promise.resolve(null) : api('/api/events')
   ]);
+  _feedLoading = false;
+  if (!posts || posts.length < 20) _feedDone = true;
+  _feedOffset += (posts?.length || 0);
   const list = qs('#feedList');
   // Upcoming events banner (next 3 within 30 days)
   const now = Date.now();
@@ -1841,7 +1876,13 @@ async function loadFeed() {
     </div>\`;
     return;
   }
-  list.innerHTML = evHtml + (posts||[]).map(p => renderPost(p)).join('');
+  if (append) {
+    list.insertAdjacentHTML('beforeend', (posts||[]).map(p => renderPost(p)).join(''));
+    if (_feedDone) list.insertAdjacentHTML('beforeend', '<div style="text-align:center;padding:24px;color:var(--muted);font-size:13px">You\'re all caught up ✓</div>');
+  } else {
+    list.innerHTML = evHtml + (posts||[]).map(p => renderPost(p)).join('');
+    list.onscroll = () => { if (list.scrollHeight - list.scrollTop - list.clientHeight < 250) loadFeed(true); };
+  }
 }
 function renderPost(p) {
   const mediaHtml = p.media?.length ? \`<div class="post-media count-\${Math.min(p.media.length,4)}">\${p.media.slice(0,4).map(m=>\`<img src="/api/photos/\${encodeURIComponent(m.r2_key)}" onclick="viewImg('\${m.r2_key}')" loading="lazy">\`).join('')}</div>\` : '';
@@ -1899,36 +1940,49 @@ function viewImg(key) {
   window.open('/api/photos/' + encodeURIComponent(key), '_blank');
 }
 let commentPostId = null;
+function _renderComments(comments) {
+  if (!comments || !comments.length) return \`<div style="text-align:center;padding:40px;color:var(--muted)"><div style="font-size:32px;margin-bottom:8px">💬</div><p>No comments yet</p></div>\`;
+  return comments.map(c => \`<div class="comment-bubble">
+    <div class="avatar avatar-sm" style="background:\${c.avatar_color||'#6366f1'};flex-shrink:0">\${initials(c.name)}</div>
+    <div class="comment-bubble-body">
+      <div class="comment-bubble-name">\${esc(c.name)}</div>
+      <div class="comment-bubble-text">\${esc(c.content)}</div>
+      <div class="comment-bubble-time">\${timeAgo(c.created_at)}</div>
+    </div>
+  </div>\`).join('');
+}
 async function loadComments(postId, authorName) {
   commentPostId = postId;
+  const sheet = document.getElementById('commentSheet');
+  const list = document.getElementById('commentList');
+  if (!sheet) return;
+  document.getElementById('commentSheetTitle').textContent = 'Comments';
+  list.innerHTML = '<div style="text-align:center;padding:32px;color:var(--muted)">Loading...</div>';
+  sheet.classList.add('open');
+  setTimeout(() => document.getElementById('commentInput')?.focus(), 350);
   const comments = await api('/api/posts/' + postId + '/comments');
-  // Simple inline comment view - show in a temp modal
-  let html = \`<div style="position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:250;display:flex;flex-direction:column;max-height:100vh">
-    <div style="background:var(--surface);flex:1;overflow-y:auto;padding:16px;padding-top:56px">
-      <button onclick="this.parentElement.parentElement.remove()" style="position:fixed;top:12px;right:16px;background:none;border:none;color:var(--muted);font-size:24px;cursor:pointer;z-index:1">×</button>
-      <h3 style="margin-bottom:12px">Comments</h3>
-      \${!comments.length ? '<p style="color:var(--muted)">No comments yet</p>' : ''}
-      \${(comments||[]).map(c=>\`<div style="display:flex;gap:8px;margin-bottom:12px">
-        <div class="avatar avatar-sm" style="background:\${c.avatar_color||'#6366f1'}">\${initials(c.name)}</div>
-        <div><span style="font-weight:600;font-size:13px">\${c.name}</span> <span style="color:var(--muted);font-size:12px">\${timeAgo(c.created_at)}</span>
-        <p style="font-size:14px;margin-top:2px">\${c.content}</p></div>
-      </div>\`).join('')}
-    </div>
-    <div style="background:var(--surface);padding:12px;display:flex;gap:8px;border-top:1px solid var(--border)">
-      <input type="text" id="commentInput" placeholder="Add a comment..." style="flex:1">
-      <button class="btn btn-primary btn-sm" onclick="submitComment()">Post</button>
-    </div>
-  </div>\`;
-  document.body.insertAdjacentHTML('beforeend', html);
+  list.innerHTML = _renderComments(comments);
+  list.scrollTop = list.scrollHeight;
+}
+function closeCommentSheet(e) {
+  if (e && e.target !== document.getElementById('commentSheet')) return;
+  document.getElementById('commentSheet')?.classList.remove('open');
 }
 async function submitComment() {
   const input = document.getElementById('commentInput');
-  const content = input.value.trim();
+  const content = input?.value.trim();
   if (!content) return;
-  await api('/api/posts/' + commentPostId + '/comments', {method:'POST', body:JSON.stringify({content})});
   input.value = '';
-  document.querySelector('[id^="commentInput"]')?.closest('[style*="position:fixed"]')?.remove();
-  loadFeed();
+  const r = await api('/api/posts/' + commentPostId + '/comments', {method:'POST', body:JSON.stringify({content})});
+  if (r?.error) { toast('\u274c ' + r.error); return; }
+  const comments = await api('/api/posts/' + commentPostId + '/comments');
+  const list = document.getElementById('commentList');
+  if (list) { list.innerHTML = _renderComments(comments); list.scrollTop = list.scrollHeight; }
+  const card = document.querySelector(\`[data-post-id="\${commentPostId}"]\`);
+  if (card) {
+    const cnt = card.querySelectorAll('.post-action')[1]?.querySelector('span:last-child');
+    if (cnt) cnt.textContent = parseInt(cnt.textContent||'0') + 1;
+  }
 }
 let postMediaFiles = [];
 function previewPostMedia() {
@@ -1947,10 +2001,12 @@ async function submitPost() {
   const r = await apiForm('/api/posts', fd);
   if (r.error) { toast('❌ ' + r.error); return; }
   closeModal('newPostModal');
-  qs('#postContent').value = '';
+  const _pc = qs('#postContent'); if (_pc) { _pc.value=''; _pc.style.height=''; }
+  const _pcc = qs('#postCharCount'); if (_pcc) _pcc.textContent='0/500';
   postMediaFiles = [];
   qs('#postMediaPreview').innerHTML = '';
   toast('Posted! 🎉');
+  _feedOffset=0; _feedDone=false;
   loadFeed();
 }
 
@@ -1958,20 +2014,26 @@ async function submitPost() {
 async function loadChats() {
   const chats = await api('/api/chats');
   const list = qs('#chatList');
-  if (!chats?.length) { list.innerHTML = '<div class="empty-state"><div class="icon">💬</div><p>No chats yet</p></div>'; return; }
+  if (!chats?.length) { list.innerHTML = '<div class="empty-state"><div class="icon">💬</div><p>No chats yet</p></div>'; const _b=document.getElementById('chatBadge'); if(_b)_b.style.display='none'; return; }
+  const _seen = JSON.parse(localStorage.getItem('fh_chat_seen')||'{}');
+  let _unreadCount = 0;
   list.innerHTML = chats.map(c => {
     const name = c.name || c.members?.filter(m=>m.id!==currentUser?.id).map(m=>m.name).join(', ') || 'Chat';
     const avatarColor = c.members?.find(m=>m.id!==currentUser?.id)?.avatar_color || '#6366f1';
     const avatarTxt = c.is_group ? '👨‍👩‍👧‍👦' : initials(name);
+    const isUnread = c.last_msg_at && c.last_sender && c.last_sender !== currentUser?.name && (!_seen[c.id] || c.last_msg_at > _seen[c.id]);
+    if (isUnread) _unreadCount++;
     return \`<div class="chat-item" onclick="openChat('\${c.id}',\${JSON.stringify(name).replace(/"/g,'&quot;')})">
       <div class="avatar" style="background:\${c.is_group?'#4f46e5':avatarColor}">\${c.is_group?'👨‍👩‍👧‍👦':initials(name)}</div>
       <div class="chat-meta">
-        <h3>\${name}</h3>
-        <p>\${c.last_msg || (c.last_sender?c.last_sender+': ...':'No messages')}</p>
+        <h3 style="\${isUnread?'font-weight:800;color:var(--text)':''}">\${name}\${isUnread?'<span style="display:inline-block;width:7px;height:7px;background:var(--primary);border-radius:50%;margin-left:6px;vertical-align:middle"></span>':''}</h3>
+        <p style="\${isUnread?'color:var(--text);font-weight:500':''}">\${c.last_msg || (c.last_sender?c.last_sender+': ...':'No messages')}</p>
       </div>
       <div class="chat-time">\${timeAgo(c.last_msg_at||c.created_at)}</div>
     </div>\`;
   }).join('');
+  const _cb = document.getElementById('chatBadge');
+  if (_cb) { _cb.textContent = _unreadCount > 9 ? '9+' : _unreadCount; _cb.style.display = _unreadCount > 0 ? 'flex' : 'none'; }
   // Pre-load users so new chat modal is ready
   if (!allUsers.length) { api('/api/users').then(u => { allUsers = u||[]; }); }
 
@@ -1987,6 +2049,11 @@ async function createChat() {
   openChat(r.id, name || 'Chat');
 }
 function openChat(chatId, chatName) {
+  const _s = JSON.parse(localStorage.getItem('fh_chat_seen')||'{}');
+  _s[chatId] = new Date().toISOString();
+  localStorage.setItem('fh_chat_seen', JSON.stringify(_s));
+  const _cb = document.getElementById('chatBadge');
+  if (_cb) { const n = Math.max(0, parseInt(_cb.textContent||'0')-1); _cb.textContent=n; _cb.style.display=n>0?'flex':'none'; }
   currentChatId = chatId;
   currentChatName = chatName;
   lastMsgTime = null;
@@ -3132,6 +3199,28 @@ let _pollIntervals = {};
 let _lastChatMsgId = null;
 let _lastFeedTs = null;
 
+function initPullToRefresh() {
+  const list = document.getElementById('feedList');
+  if (!list || list._ptr) return;
+  list._ptr = true;
+  let startY = 0, pulling = false, ind = null;
+  list.addEventListener('touchstart', e => { if (list.scrollTop === 0) { startY = e.touches[0].clientY; pulling = true; } }, {passive:true});
+  list.addEventListener('touchmove', e => {
+    if (!pulling) return;
+    const dy = e.touches[0].clientY - startY;
+    if (dy > 8 && dy < 90) {
+      if (!ind) { ind = document.createElement('div'); ind.style.cssText='text-align:center;padding:10px;color:var(--primary);font-size:13px;font-weight:600'; ind.textContent='\u2193 Pull to refresh'; list.prepend(ind); }
+      ind.style.opacity = Math.min(1, dy/60);
+      ind.textContent = dy > 60 ? '\u2191 Release to refresh' : '\u2193 Pull to refresh';
+    }
+  }, {passive:true});
+  list.addEventListener('touchend', e => {
+    if (!pulling) return; pulling = false;
+    const dy = e.changedTouches[0].clientY - startY;
+    if (ind) { ind.remove(); ind = null; }
+    if (dy > 60) { if (navigator.vibrate) navigator.vibrate(30); loadFeed(); toast('Refreshed ✓'); }
+  }, {passive:true});
+}
 function startPolling() {
   stopPolling();
   // Chat: every 5s when chat screen visible
@@ -3144,6 +3233,7 @@ function startPolling() {
     const lastId = msgs[msgs.length-1]?.id;
     if (lastId && lastId !== _lastChatMsgId) {
       _lastChatMsgId = lastId;
+      if (navigator.vibrate) navigator.vibrate([30,15,30]);
       renderMessages(msgs);
       // Auto-scroll to bottom only if already near bottom
       const ml = document.getElementById('messageList');
@@ -3157,12 +3247,13 @@ function startPolling() {
   _pollIntervals.feed = setInterval(async () => {
     const screen = document.getElementById('feedScreen');
     if (!screen || screen.classList.contains('hidden')) return;
-    const posts = await api('/api/feed');
+    const posts = await api('/api/posts?limit=20');
     if (!posts || !Array.isArray(posts) || !posts.length) return;
     const newTs = posts[0]?.created_at;
     if (newTs && newTs !== _lastFeedTs) {
       _lastFeedTs = newTs;
-      renderFeed(posts);
+      _feedOffset=0; _feedDone=false;
+      loadFeed();
     }
   }, 15000);
 
@@ -3196,6 +3287,7 @@ const _origInit = typeof initApp === 'function' ? initApp : null;
 const _pollOnLogin = setInterval(() => {
   if (currentUser && !_pollIntervals.notif) {
     startPolling();
+    initPullToRefresh();
     clearInterval(_pollOnLogin);
   }
 }, 1000);
