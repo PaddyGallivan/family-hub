@@ -106,7 +106,7 @@ async function handleAuth(path, request, env) {
   }
 
   if (path === '/api/auth/register' && method === 'POST') {
-    const {token, name, password} = await request.json();
+    const {token, name, email, password} = await request.json();
     const invite = await env.DB.prepare('SELECT * FROM invites WHERE token=? AND used=0').bind(token).first();
     if (!invite) return err('Invalid invite');
     const salt = crypto.randomUUID();
@@ -115,11 +115,11 @@ async function handleAuth(path, request, env) {
     let userId;
     if (invite.user_id) {
       userId = invite.user_id;
-      await env.DB.prepare('UPDATE users SET password_hash=?,salt=?,name=COALESCE(?,name) WHERE id=?').bind(hash, salt, name||null, userId).run();
+      await env.DB.prepare('UPDATE users SET password_hash=?,salt=?,name=COALESCE(?,name),email=COALESCE(?,email) WHERE id=?').bind(hash, salt, name||null, email||null, userId).run();
     } else {
       userId = crypto.randomUUID();
-      await env.DB.prepare('INSERT INTO users (id,name,role,password_hash,salt,avatar_color) VALUES (?,?,?,?,?,?)').bind(
-        userId, name || invite.name, invite.role, hash, salt, invite.avatar_color || '#6366f1'
+      await env.DB.prepare('INSERT INTO users (id,name,email,role,password_hash,salt,avatar_color) VALUES (?,?,?,?,?,?,?)').bind(
+        userId, name || invite.name, email||null, invite.role, hash, salt, invite.avatar_color || '#6366f1'
       ).run();
     }
     await env.DB.prepare('UPDATE invites SET used=1,used_by=?,used_at=datetime("now") WHERE token=?').bind(userId, token).run();
@@ -139,9 +139,11 @@ async function handleAuth(path, request, env) {
   }
 
   if (path === '/api/auth/login' && method === 'POST') {
-    const {name, password} = await request.json();
-    const user = await env.DB.prepare('SELECT * FROM users WHERE LOWER(name)=LOWER(?) AND password_hash IS NOT NULL ORDER BY created_at DESC').bind(name).first();
-    if (!user) return err('User not found', 401);
+    const {email, name, password} = await request.json();
+    const identifier = (email || name || '').trim();
+    if (!identifier) return err('Email is required', 400);
+    const user = await env.DB.prepare('SELECT * FROM users WHERE (LOWER(email)=LOWER(?) OR LOWER(name)=LOWER(?)) AND password_hash IS NOT NULL ORDER BY created_at DESC').bind(identifier, identifier).first();
+    if (!user) return err('No account found with that email', 401);
     const hash = await hashPassword(password, user.salt);
     if (hash !== user.password_hash) return err('Wrong password', 401);
     const token = crypto.randomUUID();
@@ -350,9 +352,9 @@ async function handleChats(path, request, env, user) {
   }
 
   if (path === '/api/chats' && method === 'POST') {
-    const {name, member_ids, is_group} = await request.json();
-    const chatId = crypto.randomUUID();
-    await env.DB.prepare('INSERT INTO chats (id,name,is_group,created_by) VALUES (?,?,?,?)').bind(chatId, name||null, is_group?1:0, user.id).run();
+    const {name, member_ids, is_group, chat_type} = await request.json();
+    const ins = await env.DB.prepare('INSERT INTO chats (name,is_group,created_by,chat_type) VALUES (?,?,?,?)').bind(name||null, is_group?1:0, user.id, chat_type||'text').run();
+    const chatId = ins.meta.last_row_id;
     const allMembers = [...new Set([user.id, ...(member_ids||[])])];
     for (const uid of allMembers) {
       await env.DB.prepare('INSERT OR IGNORE INTO chat_members (chat_id,user_id) VALUES (?,?)').bind(chatId, uid).run();
@@ -1101,6 +1103,10 @@ textarea{resize:vertical;min-height:80px}
 .chat-screen{position:fixed;inset:0;background:#0f172a;z-index:200;display:flex;flex-direction:column;transform:translateX(100%);transition:transform .3s cubic-bezier(.32,.72,0,1)}
 .chat-screen.open{transform:translateX(0)}
 .chat-messages{flex:1;overflow-y:auto;padding:12px 0;display:flex;flex-direction:column}
+.chat-messages.photo-mode { display:grid; grid-template-columns:1fr 1fr; gap:3px; padding:3px; align-content:start; }
+.photo-grid-item { position:relative; aspect-ratio:1; overflow:hidden; cursor:pointer; background:var(--surface2); border-radius:4px; }
+.photo-grid-item img { width:100%; height:100%; object-fit:cover; display:block; }
+.photo-grid-caption { position:absolute; bottom:0; left:0; right:0; padding:4px 6px; background:linear-gradient(transparent,rgba(0,0,0,.65)); color:#fff; font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .chat-input-bar{padding:8px 12px;background:var(--surface);border-top:1px solid var(--border);display:flex;gap:8px;align-items:flex-end;padding-bottom:calc(8px + env(safe-area-inset-bottom))}
 .chat-input-bar textarea{flex:1;min-height:38px;max-height:120px;border-radius:20px;padding:8px 14px;font-size:15px;resize:none;line-height:1.4}
 .send-btn{width:40px;height:40px;border-radius:50%;background:var(--primary);border:none;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
@@ -1210,9 +1216,9 @@ textarea{resize:vertical;min-height:80px}
       <div id="loginForm">
         <div id="loginError" class="auth-error"></div>
         <div class="auth-field">
-          <label>Your Name</label>
+          <label>Email</label>
           <div class="auth-field-inner">
-            <input type="text" id="loginName" placeholder="e.g. Paddy" autocomplete="username" autocapitalize="words" spellcheck="false" onkeydown="if(event.key==='Enter')document.getElementById('loginPass').focus()">
+            <input type="email" id="loginEmail" placeholder="your@email.com" autocomplete="email" autocapitalize="none" spellcheck="false" onkeydown="if(event.key==='Enter')document.getElementById('loginPass').focus()">
           </div>
         </div>
         <div class="auth-field">
@@ -1238,6 +1244,12 @@ textarea{resize:vertical;min-height:80px}
             <label>Your Name</label>
             <div class="auth-field-inner">
               <input type="text" id="inviteName" placeholder="As the family knows you" autocapitalize="words" autocomplete="name">
+            </div>
+          </div>
+          <div class="auth-field">
+            <label>Email <span style="font-weight:400;color:#64748b">(to log in later)</span></label>
+            <div class="auth-field-inner">
+              <input type="email" id="inviteEmail" placeholder="your@email.com" autocomplete="email" autocapitalize="none" spellcheck="false">
             </div>
           </div>
           <div class="auth-field">
@@ -1357,14 +1369,18 @@ textarea{resize:vertical;min-height:80px}
     </div>
     <div class="chat-messages" id="chatMessages"></div>
     <div class="chat-input-bar">
-      <label style="cursor:pointer;color:var(--muted)">
+      <label id="chatTextAttach" style="cursor:pointer;color:var(--muted);display:flex;align-items:center">
         📎
         <input type="file" id="chatFileInput" style="display:none" accept="image/*,video/*,application/pdf" onchange="sendChatFile()">
       </label>
       <textarea id="chatMsgInput" placeholder="Message..." onkeydown="handleMsgKey(event)" rows="1"></textarea>
-      <button class="send-btn" onclick="sendMsg()">
+      <button id="chatSendBtn" class="send-btn" onclick="sendMsg()">
         <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
       </button>
+      <label id="chatPhotoOnlyBtn" style="display:none;cursor:pointer;background:var(--primary);color:#fff;border-radius:50%;width:48px;height:48px;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">
+        📷
+        <input type="file" style="display:none" accept="image/*" multiple onchange="sendChatFile(this)">
+      </label>
     </div>
   </div>
 
@@ -1422,7 +1438,8 @@ textarea{resize:vertical;min-height:80px}
     <div class="modal">
       <div class="modal-handle"></div>
       <h2>New Chat</h2>
-      <div class="input-group"><label>Name (optional)</label><input type="text" id="newChatName" placeholder="Group name..."></div>
+      <div class="input-group"><label>Name (optional)</label><input type="text" id="newChatName" placeholder="e.g. Holidays, Baby pics..."></div>
+      <div class="input-group"><label>Type</label><div style="display:flex;gap:8px"><button id="chatTypeBtnText" class="btn btn-primary btn-sm" style="flex:1" onclick="selectChatType('text')">💬 Chat</button><button id="chatTypeBtnPhoto" class="btn btn-sm" style="flex:1;background:var(--surface2)" onclick="selectChatType('photo')">📷 Photo Album</button></div></div>
       <div class="input-group"><label>Members</label><div id="userCheckboxes" style="display:flex;flex-direction:column;gap:8px;max-height:200px;overflow-y:auto"></div></div>
       <button class="btn btn-primary btn-full mt-3" onclick="createChat()">Start Chat</button>
     </div>
@@ -1526,6 +1543,71 @@ textarea{resize:vertical;min-height:80px}
     </div>
   </div>
 
+
+  <!-- FAMILY SETTINGS OVERLAY -->
+  <div id="familySettingsScreen">
+    <div class="fs-header">
+      <button onclick="closeFamilySettings()" style="background:none;border:none;color:var(--text);font-size:22px;cursor:pointer;padding:4px 8px">←</button>
+      <h2 style="flex:1;margin:0;font-size:18px">⚙️ Family Settings</h2>
+    </div>
+    <div style="padding:16px;max-width:520px;margin:0 auto">
+
+      <div style="background:var(--surface);border-radius:12px;padding:16px;margin-bottom:14px">
+        <h3 style="font-size:15px;margin:0 0 12px">🏠 Family Info</h3>
+        <div class="input-group"><label>Family Name</label><input type="text" id="familyNameInput" placeholder="The Gallivans..."></div>
+        <div class="input-group"><label>Description</label><input type="text" id="familyDescInput" placeholder="Our family app"></div>
+        <button class="btn btn-primary" onclick="saveFamilyInfo()">Save</button>
+      </div>
+
+      <div style="background:var(--surface);border-radius:12px;padding:16px;margin-bottom:14px">
+        <h3 style="font-size:15px;margin:0 0 8px">🔗 Invite Code</h3>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 10px">Share this link so family can join</p>
+        <div class="invite-code-box">
+          <span id="familyInviteCode" style="font-size:22px;letter-spacing:3px;font-family:monospace">------</span>
+          <button class="btn-sm" onclick="copyInviteCode()">Copy</button>
+        </div>
+        <p style="font-size:11px;color:var(--muted);margin:8px 0 0">Link: hub.luckdragon.io/?invite=<span id="inviteCodeDisplay">...</span></p>
+      </div>
+
+      <div style="background:var(--surface);border-radius:12px;padding:16px;margin-bottom:14px">
+        <h3 style="font-size:15px;margin:0 0 12px">👥 Members</h3>
+        <div id="familyMembersList"></div>
+      </div>
+
+      <div style="background:var(--surface);border-radius:12px;padding:16px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+          <h3 style="font-size:15px;margin:0">📨 Pending Invites</h3>
+          <button class="btn-sm" onclick="toggleNewInviteForm()">+ New</button>
+        </div>
+        <div id="newInviteForm" style="display:none;background:var(--surface2);border-radius:8px;padding:12px;margin-bottom:10px">
+          <div class="input-group" style="margin-bottom:8px"><label style="font-size:12px">Name</label><input type="text" id="newInviteName" placeholder="e.g. Kelly"></div>
+          <div class="input-group" style="margin-bottom:8px"><label style="font-size:12px">Email</label><input type="email" id="newInviteEmail" placeholder="their@email.com"></div>
+          <div class="input-group" style="margin-bottom:10px"><label style="font-size:12px">Role</label><input type="text" id="newInviteRole" placeholder="e.g. Sister, Partner..."></div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-primary btn-sm" onclick="createAndSendInvite()">Send Invite</button>
+            <button class="btn-sm" onclick="toggleNewInviteForm()">Cancel</button>
+          </div>
+        </div>
+        <div id="pendingInvitesList"><div style="color:var(--muted);font-size:13px">Loading...</div></div>
+      </div>
+
+      <div style="background:var(--surface);border-radius:12px;padding:16px;margin-bottom:14px">
+        <h3 style="font-size:15px;margin:0 0 12px">🎛️ Features</h3>
+        <div id="featureToggles"></div>
+      </div>
+
+      <div style="background:var(--surface);border-radius:12px;padding:16px;margin-bottom:14px">
+        <h3 style="font-size:15px;margin:0 0 12px">📋 Family Rules</h3>
+        <div id="familyRulesList"></div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <input type="text" id="newRuleInput" placeholder="Add a rule..." style="flex:1;padding:8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
+          <button class="btn btn-primary btn-sm" onclick="addFamilyRule()">Add</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
 </div>
 
@@ -1536,6 +1618,7 @@ let currentUser = null;
 let allUsers = [];
 let currentChatId = null;
 let currentChatName = '';
+let currentChatType = 'text';
 let chatPollInterval = null;
 let lastMsgTime = null;
 let currentMoreTab = 'birthdays';
@@ -1651,14 +1734,16 @@ async function doInviteNext() {
     if (btn) btn.textContent = 'Create Account';
   } else {
     const name = (qs('#inviteName').value || '').trim();
+    const email = (qs('#inviteEmail').value || '').trim();
     const password = qs('#invitePass').value || '';
     if (!name) { showAuthError('inviteError', 'Enter your name'); return; }
+    if (!email) { showAuthError('inviteError', "Enter your email — you'll need it to log in"); qs('#inviteEmail').focus(); return; }
     if (password.length < 6) { showAuthError('inviteError', 'Password must be at least 6 characters'); return; }
     if (btn) { btn.disabled = true; btn.textContent = 'Creating account…'; }
-    const data = await api('/api/auth/register', {method:'POST', body:JSON.stringify({token:inviteToken, name, password})});
+    const data = await api('/api/auth/register', {method:'POST', body:JSON.stringify({token:inviteToken, name, email, password})});
     if (btn) { btn.disabled = false; btn.textContent = 'Create Account'; }
     if (!data || data.error) { showAuthError('inviteError', data?.error || 'Registration failed'); return; }
-    localStorage.setItem('fh_last_name', name);
+    localStorage.setItem('fh_last_email', email);
     session = {token: data.token, user: data.user};
     localStorage.setItem('fh_session', JSON.stringify(session));
     startApp();
@@ -1667,17 +1752,17 @@ async function doInviteNext() {
 
 async function doLogin() {
   clearAuthErrors();
-  const name = (qs('#loginName').value || '').trim();
+  const email = (qs('#loginEmail').value || '').trim();
   const password = qs('#loginPass').value || '';
-  if (!name) { showAuthError('loginError', 'Enter your name'); qs('#loginName').focus(); return; }
+  if (!email) { showAuthError('loginError', 'Enter your email'); qs('#loginEmail').focus(); return; }
   if (!password) { showAuthError('loginError', 'Enter your password'); qs('#loginPass').focus(); return; }
   const btn = document.getElementById('loginBtn');
   if (btn) { btn.disabled = true; btn.textContent = 'Logging in…'; }
-  localStorage.setItem('fh_last_name', name);
-  const data = await api('/api/auth/login', {method:'POST', body:JSON.stringify({name, password})});
+  localStorage.setItem('fh_last_email', email);
+  const data = await api('/api/auth/login', {method:'POST', body:JSON.stringify({email, password})});
   if (btn) { btn.disabled = false; btn.textContent = 'Log In'; }
   if (!data || data.error) {
-    const msg = data?.error === 'User not found' ? 'Name not found — check the spelling'
+    const msg = data?.error === 'No account found with that email' ? 'No account found — check your email'
               : data?.error === 'Wrong password' ? 'Wrong password — try again'
               : 'Login failed — try again';
     showAuthError('loginError', msg);
@@ -1689,9 +1774,9 @@ async function doLogin() {
 }
 
 // Pre-fill saved name; check invite URL param
-const _savedName = localStorage.getItem('fh_last_name');
-if (_savedName && document.getElementById('loginName')) {
-  document.getElementById('loginName').value = _savedName;
+const _savedEmail = localStorage.getItem('fh_last_email') || localStorage.getItem('fh_last_name');
+if (_savedEmail && document.getElementById('loginEmail')) {
+  document.getElementById('loginEmail').value = _savedEmail;
 }
 const _urlParams = new URLSearchParams(location.search);
 const urlInvite = _urlParams.get('token') || _urlParams.get('invite');
@@ -2045,10 +2130,10 @@ async function loadChats() {
   list.innerHTML = chats.map(c => {
     const name = c.name || c.members?.filter(m=>m.id!==currentUser?.id).map(m=>m.name).join(', ') || 'Chat';
     const avatarColor = c.members?.find(m=>m.id!==currentUser?.id)?.avatar_color || '#6366f1';
-    const avatarTxt = c.is_group ? '👨‍👩‍👧‍👦' : initials(name);
+    const avatarTxt = c.chat_type === 'photo' ? '📷' : (c.is_group ? '👨‍👩‍👧‍👦' : initials(name));
     const isUnread = c.last_msg_at && c.last_sender && c.last_sender !== currentUser?.name && (!_seen[c.id] || c.last_msg_at > _seen[c.id]);
     if (isUnread) _unreadCount++;
-    return \`<div class="chat-item" onclick="openChat('\${c.id}',\${JSON.stringify(name).replace(/"/g,'&quot;')})">
+    return \`<div class="chat-item" onclick="openChat('\${c.id}',\${JSON.stringify(name).replace(/"/g,'&quot;')},'\${c.chat_type||'text'}')">
       <div class="avatar" style="background:\${c.is_group?'#4f46e5':avatarColor}">\${c.is_group?'👨‍👩‍👧‍👦':initials(name)}</div>
       <div class="chat-meta">
         <h3 style="\${isUnread?'font-weight:800;color:var(--text)':''}">\${name}\${isUnread?'<span style="display:inline-block;width:7px;height:7px;background:var(--primary);border-radius:50%;margin-left:6px;vertical-align:middle"></span>':''}</h3>
@@ -2063,18 +2148,27 @@ async function loadChats() {
   if (!allUsers.length) { api('/api/users').then(u => { allUsers = u||[]; }); }
 }
 
+function selectChatType(type) {
+  window._newChatType = type;
+  const isPhoto = type === 'photo';
+  const tb = qs('#chatTypeBtnText'), pb = qs('#chatTypeBtnPhoto');
+  if (tb) { tb.className = isPhoto ? 'btn btn-sm' : 'btn btn-primary btn-sm'; tb.style.background = isPhoto ? 'var(--surface2)' : ''; }
+  if (pb) { pb.className = isPhoto ? 'btn btn-primary btn-sm' : 'btn btn-sm'; pb.style.background = isPhoto ? '' : 'var(--surface2)'; }
+}
 async function createChat() {
   const name = qs('#newChatName').value.trim();
   const selected = Array.from(document.querySelectorAll('#userCheckboxes input:checked')).map(i=>i.value);
   if (!selected.length) { toast('Pick at least one person'); return; }
-  const r = await api('/api/chats', {method:'POST', body:JSON.stringify({name: name||null, member_ids:selected, is_group: selected.length>1})});
+  const chat_type = window._newChatType || 'text';
+  window._newChatType = 'text';
+  const r = await api('/api/chats', {method:'POST', body:JSON.stringify({name: name||null, member_ids:selected, is_group: selected.length>1||chat_type==='photo', chat_type})});
   if (r.error) { toast('❌ ' + r.error); return; }
   closeModal('newChatModal');
   toast('Chat created!');
   loadChats();
   openChat(r.id, name || 'Chat');
 }
-function openChat(chatId, chatName) {
+function openChat(chatId, chatName, chatType) {
   const _s = JSON.parse(localStorage.getItem('fh_chat_seen')||'{}');
   _s[chatId] = new Date().toISOString();
   localStorage.setItem('fh_chat_seen', JSON.stringify(_s));
@@ -2082,8 +2176,15 @@ function openChat(chatId, chatName) {
   if (_cb) { const n = Math.max(0, parseInt(_cb.textContent||'0')-1); _cb.textContent=n; _cb.style.display=n>0?'flex':'none'; }
   currentChatId = chatId;
   currentChatName = chatName;
+  currentChatType = chatType || 'text';
   lastMsgTime = null;
   qs('#chatScreenName').textContent = chatName;
+  const _isPhoto = currentChatType === 'photo';
+  qs('#chatMessages').className = 'chat-messages' + (_isPhoto ? ' photo-mode' : '');
+  if (qs('#chatMsgInput')) qs('#chatMsgInput').style.display = _isPhoto ? 'none' : '';
+  if (qs('#chatSendBtn')) qs('#chatSendBtn').style.display = _isPhoto ? 'none' : '';
+  if (qs('#chatTextAttach')) qs('#chatTextAttach').style.display = _isPhoto ? 'none' : 'flex';
+  if (qs('#chatPhotoOnlyBtn')) qs('#chatPhotoOnlyBtn').style.display = _isPhoto ? 'flex' : 'none';
   qs('#chatScreen').classList.add('open');
   loadMessages(chatId);
   if (chatPollInterval) clearInterval(chatPollInterval);
@@ -2120,6 +2221,9 @@ function appendMessages(msgs) {
   if (atBottom) container.scrollTop = container.scrollHeight;
 }
 function renderMsg(m) {
+  if (currentChatType === 'photo' && m.msg_type === 'image' && m.media_key) {
+    return \`<div class="photo-grid-item" onclick="viewImg('\${m.media_key}')"><img src="/api/photos/\${encodeURIComponent(m.media_key)}" loading="lazy"><div class="photo-grid-caption">\${esc(m.sender_name)}\${m.content?' · '+esc(m.content):''}</div></div>\`;
+  }
   const mine = m.user_id === currentUser?.id;
   let content = '';
   if (m.msg_type === 'image' && m.media_key) {
@@ -2154,16 +2258,20 @@ async function sendMsg() {
     lastMsgTime = now;
   }
 }
-async function sendChatFile() {
-  const file = qs('#chatFileInput').files[0];
-  if (!file || !currentChatId) return;
-  const fd = new FormData();
-  fd.append('file', file);
+async function sendChatFile(inputEl) {
+  const input = inputEl || qs('#chatFileInput');
+  if (!input?.files?.length || !currentChatId) return;
   const headers = {};
   if (session?.token) headers['x-session-token'] = session.token;
-  const r = await fetch('/api/chats/'+currentChatId+'/messages', {method:'POST', headers, body:fd}).then(r=>r.json());
-  if (r.error) toast('❌ ' + r.error);
-  else { toast('File sent!'); lastMsgTime = new Date().toISOString(); }
+  for (const file of Array.from(input.files)) {
+    const fd = new FormData();
+    fd.append('file', file);
+    const r = await fetch('/api/chats/'+currentChatId+'/messages', {method:'POST', headers, body:fd}).then(r=>r.json());
+    if (r.error) { toast('❌ ' + r.error); break; }
+  }
+  input.value = '';
+  lastMsgTime = new Date().toISOString();
+  loadMessages(currentChatId);
 }
 function handleMsgKey(e) {
   if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
@@ -2735,6 +2843,9 @@ async function openFamilySettings() {
   document.getElementById('familyNameInput').value = fam.name||'';
   document.getElementById('familyDescInput').value = fam.description||'';
   document.getElementById('familyInviteCode').textContent = fam.invite_code||'------';
+  const codeEl = document.getElementById('inviteCodeDisplay');
+  if (codeEl) codeEl.textContent = fam.invite_code||'';
+  loadPendingInvites();
   const settings = await api('/api/families/'+fam.id+'/settings')||{};
   const FEATURES = ['Feed','Stories','Chats','Events','Birthdays','Gifts','KK Draw','Expenses','Transfers','Vault','Shopping','Chores','Meals','Milestones','Recipes','Kindness'];
   document.getElementById('featureToggles').innerHTML = FEATURES.map(f=>\`
@@ -2755,6 +2866,49 @@ async function openFamilySettings() {
     </div>\`).join('');
 }
 function closeFamilySettings() { document.getElementById('familySettingsScreen').classList.remove('open'); }
+function toggleNewInviteForm() {
+  const el = document.getElementById('newInviteForm');
+  if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+async function loadPendingInvites() {
+  const el = document.getElementById('pendingInvitesList');
+  if (!el) return;
+  const invites = await api('/api/admin/invites') || [];
+  if (!invites.length) { el.innerHTML = '<div style="color:var(--muted);font-size:13px">All invites accepted ✓</div>'; return; }
+  el.innerHTML = invites.map(inv => \`
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="flex:1">
+        <div style="font-size:14px;font-weight:600">\${esc(inv.name)}</div>
+        <div style="font-size:11px;color:var(--muted)">\${inv.role||'member'}\${inv.email?' · '+esc(inv.email):''}</div>
+      </div>
+      <button class="btn-sm" onclick="sendInviteEmail(\${inv.id},'\${inv.name}')" style="font-size:11px">📧 \${inv.email ? 'Resend' : 'Email'}</button>
+    </div>
+  \`).join('');
+}
+async function sendInviteEmail(inviteId, name) {
+  const el = document.querySelector(\`#pendingInvitesList button[onclick*="sendInviteEmail(\${inviteId}"]\`);
+  // Prompt for email if not stored
+  let email = prompt(\`Email address for \${name}:\`);
+  if (!email) return;
+  const r = await api(\`/api/admin/invites/\${inviteId}/email\`, {method:'POST', body:JSON.stringify({email})});
+  if (r && r.ok) { toast(\`📧 Invite sent to \${email}!\`); loadPendingInvites(); }
+  else toast('❌ ' + (r?.error || 'Failed to send'));
+}
+async function createAndSendInvite() {
+  const name = document.getElementById('newInviteName')?.value.trim();
+  const email = document.getElementById('newInviteEmail')?.value.trim();
+  const role = document.getElementById('newInviteRole')?.value.trim() || 'member';
+  if (!name) { toast('Enter a name'); return; }
+  const r = await api('/api/admin/invites', {method:'POST', body:JSON.stringify({name, email, role})});
+  if (r?.ok) {
+    toast(email ? \`📧 Invite sent to \${email}!\` : '✅ Invite created');
+    document.getElementById('newInviteName').value = '';
+    document.getElementById('newInviteEmail').value = '';
+    document.getElementById('newInviteRole').value = '';
+    toggleNewInviteForm();
+    loadPendingInvites();
+  } else toast('❌ ' + (r?.error || 'Failed'));
+}
 async function saveFamilyInfo() {
   const fam = await ensureFamily();
   if (!fam) return;
@@ -2785,7 +2939,8 @@ async function applyAllFeatureToggles() {
 }
 function copyInviteCode() {
   const code = document.getElementById('familyInviteCode').textContent;
-  if (navigator.clipboard) { navigator.clipboard.writeText(code).then(()=>toast('Copied! 📋')); }
+  const link = 'https://hub.luckdragon.io/?invite=' + code;
+  if (navigator.clipboard) { navigator.clipboard.writeText(link).then(()=>toast('Link copied! 📋')); }
   else { const t=document.createElement('textarea');t.value=code;document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);toast('Copied! 📋'); }
 }
 async function loadFamilyRules(familyId) {
@@ -2914,8 +3069,19 @@ async function deleteChore(id){if(!confirm('Delete this chore?'))return;await ap
 const DAYS=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
 async function loadMeals() {
   const c = qs('#moreContent');
-  c.innerHTML = '<div style="padding:16px"><h3 style="font-size:16px;font-weight:700;margin-bottom:12px">🍽️ Meal Rota</h3><div id="mealGrid"></div></div>';
-  const resp = await api('/api/meals');
+  const weekLabel = mealWeekOffset === 0 ? 'This Week' : mealWeekOffset === -1 ? 'Last Week' : mealWeekOffset === 1 ? 'Next Week' : (mealWeekOffset > 0 ? \`+\${mealWeekOffset}w\` : \`\${mealWeekOffset}w\`);
+  c.innerHTML = \`<div style="padding:16px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h3 style="font-size:16px;font-weight:700;margin:0">🍽️ Meal Rota</h3>
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="btn-sm" onclick="mealWeekOffset--;loadMeals()">‹</button>
+        <span style="font-size:13px;font-weight:600;min-width:80px;text-align:center">\${weekLabel}</span>
+        <button class="btn-sm" onclick="mealWeekOffset++;loadMeals()">›</button>
+      </div>
+    </div>
+    <div id="mealGrid"></div>
+  </div>\`;
+  const resp = await api('/api/meals?offset=' + mealWeekOffset);
   const meals = (resp && resp.meals) || [];
   const grid = document.getElementById('mealGrid');
   if (!grid) return;
@@ -2953,7 +3119,7 @@ async function saveMeal(i){
   const meal=document.getElementById('mealInput_'+i)?.value.trim();
   const cook_id=document.getElementById('mealCook_'+i)?.value||null;
   if(!meal)return;
-  await api('/api/meals',{method:'POST',body:JSON.stringify({day_of_week:i,meal,cook_id})});
+  await api('/api/meals',{method:'POST',body:JSON.stringify({day_of_week:i,meal,cook_id,week_offset:mealWeekOffset})});
   loadMeals();
 }
 
@@ -3521,7 +3687,9 @@ export default {
     `CREATE TABLE IF NOT EXISTS album_reactions (photo_id TEXT NOT NULL, user_id TEXT NOT NULL, reaction TEXT NOT NULL, PRIMARY KEY (photo_id,user_id))`,
     `CREATE TABLE IF NOT EXISTS meal_rota (id TEXT PRIMARY KEY, week_date TEXT NOT NULL, day_of_week INTEGER NOT NULL, meal TEXT NOT NULL, cook_id TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE(week_date, day_of_week))`,
     `ALTER TABLE invites ADD COLUMN user_id TEXT`,
+    `ALTER TABLE invites ADD COLUMN email TEXT`,
     `CREATE TABLE IF NOT EXISTS story_views (story_id TEXT NOT NULL, user_id TEXT NOT NULL, viewed_at DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (story_id, user_id))`,
+    `ALTER TABLE chats ADD COLUMN chat_type TEXT NOT NULL DEFAULT 'text'`,
   ];
   for (const sql of v3tables) { try { await env.DB.exec(sql); } catch(e) {} }
 
@@ -3939,22 +4107,65 @@ export default {
     }
 
     // ── MEAL ROTA ─────────────────────────────────────────────────────────────
+    // ── ADMIN: invites
+    if (path === '/api/admin/invites' && method === 'GET') {
+      if (!user || user.role !== 'admin') return err('Forbidden', 403);
+      const rows = await env.DB.prepare('SELECT id,name,role,token,email FROM invites WHERE used=0 ORDER BY id').all();
+      return json(rows.results);
+    }
+    if (path === '/api/admin/invites' && method === 'POST') {
+      if (!user || user.role !== 'admin') return err('Forbidden', 403);
+      const {name, email, role} = await request.json();
+      if (!name) return err('Name required');
+      const token = Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b=>b.toString(16).padStart(2,'0')).join('');
+      const invId = await env.DB.prepare('INSERT INTO invites (name,role,token,email) VALUES (?,?,?,?) RETURNING id').bind(name, role||'member', token, email||null).first();
+      // Send email if provided
+      if (email && env.RESEND_API_KEY) {
+        const link = `https://hub.luckdragon.io/?invite=${token}`;
+        await fetch('https://api.resend.com/emails', {
+          method:'POST', headers:{'Authorization':`Bearer ${env.RESEND_API_KEY}`,'Content-Type':'application/json'},
+          body:JSON.stringify({from:'Family Hub <paddy@luckdragon.io>',to:[email],subject:`${user.name} invited you to Family Hub 🏠`,html:`<p>Hi ${name}! ${user.name} has invited you to join the Gallivan Family Hub.</p><p><a href="${link}" style="background:#6366f1;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block">Join Family Hub →</a></p><p>Or copy this link: ${link}</p>`})
+        });
+      }
+      return json({ok:true, id:invId?.id, token});
+    }
+    if (/^\/api\/admin\/invites\/\d+\/email$/.test(path) && method === 'POST') {
+      if (!user || user.role !== 'admin') return err('Forbidden', 403);
+      const inviteId = parseInt(path.split('/')[4]);
+      const {email} = await request.json();
+      if (!email) return err('Email required');
+      const invite = await env.DB.prepare('SELECT * FROM invites WHERE id=?').bind(inviteId).first();
+      if (!invite) return err('Invite not found', 404);
+      // Store email on invite
+      await env.DB.prepare('UPDATE invites SET email=? WHERE id=?').bind(email, inviteId).run();
+      // Send via Resend
+      if (!env.RESEND_API_KEY) return err('Email not configured');
+      const link = `https://hub.luckdragon.io/?invite=${invite.token}`;
+      const resp = await fetch('https://api.resend.com/emails', {
+        method:'POST', headers:{'Authorization':`Bearer ${env.RESEND_API_KEY}`,'Content-Type':'application/json'},
+        body:JSON.stringify({from:'Family Hub <paddy@luckdragon.io>',to:[email],subject:`${user.name} invited you to Family Hub 🏠`,html:`<p>Hi ${invite.name}! ${user.name} has invited you to join the Gallivan Family Hub.</p><p><a href="${link}" style="background:#6366f1;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block">Join Family Hub →</a></p><p>Or copy this link: ${link}</p><p style="color:#888;font-size:12px">Reply to this email if you have questions.</p>`})
+      });
+      const resendData = await resp.json();
+      if (resp.ok) return json({ok:true});
+      return err('Email send failed: ' + JSON.stringify(resendData), 500);
+    }
     if (path === '/api/meals' && method === 'GET') {
-      // Get monday of current week
+      // Get monday of target week (offset in weeks)
+      const offsetParam = parseInt(url.searchParams.get('offset')||'0');
       const now = new Date();
       const day = now.getDay();
       const monday = new Date(now);
-      monday.setDate(now.getDate() - (day===0?6:day-1));
+      monday.setDate(now.getDate() - (day===0?6:day-1) + (offsetParam*7));
       const weekDate = monday.toISOString().slice(0,10);
       const rows = await env.DB.prepare('SELECT mr.*,u.name as cook_name FROM meal_rota mr LEFT JOIN users u ON u.id=mr.cook_id WHERE mr.week_date=? ORDER BY mr.day_of_week').bind(weekDate).all();
       return json({week_date:weekDate, meals:rows.results});
     }
     if (path === '/api/meals' && method === 'POST') {
-      const {day_of_week,meal,cook_id} = await request.json();
+      const {day_of_week,meal,cook_id,week_offset} = await request.json();
       const now = new Date();
       const day = now.getDay();
       const monday = new Date(now);
-      monday.setDate(now.getDate() - (day===0?6:day-1));
+      monday.setDate(now.getDate() - (day===0?6:day-1) + ((week_offset||0)*7));
       const weekDate = monday.toISOString().slice(0,10);
       const id = crypto.randomUUID();
       await env.DB.prepare('INSERT OR REPLACE INTO meal_rota (id,week_date,day_of_week,meal,cook_id) VALUES (COALESCE((SELECT id FROM meal_rota WHERE week_date=? AND day_of_week=?),?),?,?,?,?)').bind(weekDate,day_of_week,id,weekDate,day_of_week,meal,cook_id||null).run();
