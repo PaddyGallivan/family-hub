@@ -1024,13 +1024,25 @@ textarea{resize:vertical;min-height:80px}
 .toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#1e293b;color:#f1f5f9;padding:10px 20px;border-radius:12px;font-size:14px;z-index:500;box-shadow:0 4px 20px rgba(0,0,0,.4);opacity:0;transition:opacity .3s;pointer-events:none}
 .toast.show{opacity:1}
 /* AUTH */
-.auth-screen{position:fixed;inset:0;background:#0f172a;z-index:300;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px}
-.auth-screen h1{font-size:32px;font-weight:800;margin-bottom:6px}
-.auth-screen p{color:var(--muted);margin-bottom:32px;text-align:center}
-.auth-card{background:var(--surface);border-radius:20px;padding:24px;width:100%;max-width:380px}
-.auth-tabs{display:flex;background:var(--surface2);border-radius:10px;padding:3px;margin-bottom:20px}
-.auth-tab{flex:1;text-align:center;padding:6px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;color:var(--muted);transition:all .2s}
-.auth-tab.active{background:var(--primary);color:#fff}
+.auth-screen{position:fixed;inset:0;background:linear-gradient(150deg,#1e1b4b 0%,#0f172a 55%,#1e1b4b 100%);z-index:300;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px;overflow-y:auto}
+.auth-screen h1{font-size:30px;font-weight:800;margin-bottom:4px}
+.auth-screen>p{color:var(--muted);margin-bottom:24px;text-align:center;font-size:14px}
+.auth-card{background:rgba(30,27,75,.65);border:1px solid rgba(99,102,241,.3);border-radius:24px;padding:28px 22px;width:100%;max-width:380px}
+.auth-tabs{display:flex;background:rgba(15,23,42,.6);border-radius:12px;padding:4px;margin-bottom:24px;gap:4px}
+.auth-tab{flex:1;text-align:center;padding:10px;border-radius:9px;cursor:pointer;font-size:14px;font-weight:600;color:var(--muted);transition:all .2s;-webkit-tap-highlight-color:transparent;user-select:none}
+.auth-tab.active{background:var(--primary);color:#fff;box-shadow:0 2px 8px rgba(99,102,241,.4)}
+.auth-field{margin-bottom:16px}
+.auth-field label{display:block;font-size:11px;font-weight:700;color:#94a3b8;margin-bottom:6px;text-transform:uppercase;letter-spacing:.6px}
+.auth-field-inner{position:relative}
+.auth-field input{width:100%;padding:14px 16px;background:rgba(15,23,42,.8);border:1.5px solid rgba(99,102,241,.2);border-radius:12px;color:var(--text);font-size:16px;outline:none;-webkit-appearance:none;transition:border .2s}
+.auth-field input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+.auth-field input::placeholder{color:#475569}
+.auth-eye{position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;color:#64748b;cursor:pointer;font-size:18px;padding:4px;line-height:1;-webkit-tap-highlight-color:transparent}
+.auth-error{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);border-radius:10px;color:#fca5a5;font-size:13px;padding:10px 14px;margin-bottom:14px;display:none;line-height:1.4}
+.auth-btn{width:100%;padding:15px;background:var(--primary);color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer;-webkit-tap-highlight-color:transparent;margin-top:4px;box-shadow:0 4px 14px rgba(99,102,241,.35);transition:transform .1s,opacity .15s}
+.auth-btn:active{transform:scale(.97);opacity:.9}
+.auth-btn:disabled{opacity:.55;cursor:not-allowed}
+.auth-divider{text-align:center;color:#475569;font-size:12px;margin:12px 0 16px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
 /* CHAT SCREEN */
 .chat-screen{position:fixed;inset:0;background:#0f172a;z-index:200;display:flex;flex-direction:column;transform:translateX(100%);transition:transform .3s cubic-bezier(.32,.72,0,1)}
 .chat-screen.open{transform:translateX(0)}
@@ -1133,28 +1145,59 @@ textarea{resize:vertical;min-height:80px}
 <div class="app" id="app">
   <!-- AUTH -->
   <div class="auth-screen" id="authScreen">
-    <div style="font-size:52px;margin-bottom:8px">🏠</div>
+    <div style="font-size:54px;margin-bottom:10px;filter:drop-shadow(0 4px 16px rgba(99,102,241,.5))">🏠</div>
     <h1>Family Hub</h1>
     <p>Your private family space</p>
     <div class="auth-card">
       <div class="auth-tabs">
         <div class="auth-tab active" onclick="switchAuthTab('login')">Log In</div>
-        <div class="auth-tab" onclick="switchAuthTab('invite')">Join</div>
+        <div class="auth-tab" onclick="switchAuthTab('invite')">Join Family</div>
       </div>
       <div id="loginForm">
-        <div class="input-group"><label>Name</label><input type="text" id="loginName" placeholder="Your name"></div>
-        <div class="input-group"><label>Password</label><input type="password" id="loginPass" placeholder="Password"></div>
-        <button class="btn btn-primary btn-full" onclick="doLogin()">Log In</button>
+        <div id="loginError" class="auth-error"></div>
+        <div class="auth-field">
+          <label>Your Name</label>
+          <div class="auth-field-inner">
+            <input type="text" id="loginName" placeholder="e.g. Paddy" autocomplete="username" autocapitalize="words" spellcheck="false" onkeydown="if(event.key==='Enter')document.getElementById('loginPass').focus()">
+          </div>
+        </div>
+        <div class="auth-field">
+          <label>Password</label>
+          <div class="auth-field-inner">
+            <input type="password" id="loginPass" placeholder="Your password" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()" style="padding-right:44px">
+            <button class="auth-eye" type="button" onclick="togglePwd('loginPass',this)" tabindex="-1">👁</button>
+          </div>
+        </div>
+        <button class="auth-btn" id="loginBtn" onclick="doLogin()">Log In</button>
       </div>
       <div id="inviteForm" style="display:none">
-        <div class="input-group"><label>Invite Code</label><input type="text" id="inviteCode" placeholder="Paste your invite link or code"></div>
-        <div id="inviteNameRow" style="display:none">
-          <div class="input-group"><label>Your Name</label><input type="text" id="inviteName"></div>
-          <div class="input-group"><label>Choose Password</label><input type="password" id="invitePass" placeholder="Min 6 characters"></div>
+        <div id="inviteError" class="auth-error"></div>
+        <div class="auth-field">
+          <label>Invite Link or Code</label>
+          <div class="auth-field-inner">
+            <input type="text" id="inviteCode" placeholder="Paste your invite link here" autocomplete="off" autocapitalize="none" spellcheck="false">
+          </div>
         </div>
-        <button class="btn btn-primary btn-full" onclick="doInviteNext()" id="inviteBtn">Check Code</button>
+        <div id="inviteNameRow" style="display:none">
+          <div class="auth-divider">Set up your account</div>
+          <div class="auth-field">
+            <label>Your Name</label>
+            <div class="auth-field-inner">
+              <input type="text" id="inviteName" placeholder="As the family knows you" autocapitalize="words" autocomplete="name">
+            </div>
+          </div>
+          <div class="auth-field">
+            <label>Choose Password</label>
+            <div class="auth-field-inner">
+              <input type="password" id="invitePass" placeholder="Min 6 characters" autocomplete="new-password" onkeydown="if(event.key==='Enter')doInviteNext()" style="padding-right:44px">
+              <button class="auth-eye" type="button" onclick="togglePwd('invitePass',this)" tabindex="-1">👁</button>
+            </div>
+          </div>
+        </div>
+        <button class="auth-btn" onclick="doInviteNext()" id="inviteBtn">Check Code →</button>
       </div>
     </div>
+    <p style="margin-top:16px;font-size:11px;color:#334155">hub.luckdragon.io</p>
   </div>
 
   <!-- MAIN APP -->
@@ -1492,22 +1535,58 @@ function switchAuthTab(tab) {
 }
 
 let inviteToken = null;
+function togglePwd(inputId, btn) {
+  const inp = document.getElementById(inputId);
+  if (!inp) return;
+  const show = inp.type === 'password';
+  inp.type = show ? 'text' : 'password';
+  btn.textContent = show ? '🙈' : '👁';
+}
+function showAuthError(id, msg) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+function clearAuthErrors() {
+  ['loginError','inviteError'].forEach(id => { const el=document.getElementById(id); if(el) el.style.display='none'; });
+}
 async function doInviteNext() {
-  const raw = qs('#inviteCode').value.trim();
-  const token = raw.includes('invite=') ? raw.split('invite=')[1] : raw;
+  clearAuthErrors();
+  let raw = (qs('#inviteCode').value || '').trim();
+  // Extract token from full URL
+  try { const u = new URL(raw); raw = u.searchParams.get('token') || u.searchParams.get('invite') || raw; } catch(e){}
+  raw = raw.replace(/.*[?&](token|invite)=/,'').trim();
+  if (!raw) { showAuthError('inviteError', 'Paste your invite link here first'); return; }
+  const btn = document.getElementById('inviteBtn');
   if (!inviteToken) {
-    const data = await api('/api/auth/invite?token=' + token);
-    if (data.error) { toast('❌ ' + data.error); return; }
-    inviteToken = token;
+    if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+    const data = await api('/api/auth/invite?token=' + encodeURIComponent(raw));
+    if (btn) { btn.disabled = false; }
+    if (!data || data.error) {
+      showAuthError('inviteError', 'Invalid or expired invite — ask for a new link');
+      if (btn) btn.textContent = 'Check Code →';
+      return;
+    }
+    if (data.registered) {
+      showAuthError('inviteError', 'Already registered — use Log In instead');
+      if (btn) btn.textContent = 'Check Code →';
+      return;
+    }
+    inviteToken = raw;
     qs('#inviteName').value = data.name || '';
     qs('#inviteNameRow').style.display = 'block';
-    qs('#inviteBtn').textContent = 'Join Family';
+    if (btn) btn.textContent = 'Create Account';
   } else {
-    const name = qs('#inviteName').value.trim();
-    const password = qs('#invitePass').value;
-    if (!name || password.length < 6) { toast('Fill in name and password (6+ chars)'); return; }
-    const data = await api('/api/auth/register', {method:'POST',body:JSON.stringify({token:inviteToken, name, password})});
-    if (data.error) { toast('❌ ' + data.error); return; }
+    const name = (qs('#inviteName').value || '').trim();
+    const password = qs('#invitePass').value || '';
+    if (!name) { showAuthError('inviteError', 'Enter your name'); return; }
+    if (password.length < 6) { showAuthError('inviteError', 'Password must be at least 6 characters'); return; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Creating account…'; }
+    const data = await api('/api/auth/register', {method:'POST', body:JSON.stringify({token:inviteToken, name, password})});
+    if (btn) { btn.disabled = false; btn.textContent = 'Create Account'; }
+    if (!data || data.error) { showAuthError('inviteError', data?.error || 'Registration failed'); return; }
+    localStorage.setItem('fh_last_name', name);
     session = {token: data.token, user: data.user};
     localStorage.setItem('fh_session', JSON.stringify(session));
     startApp();
@@ -1515,21 +1594,38 @@ async function doInviteNext() {
 }
 
 async function doLogin() {
-  const name = qs('#loginName').value.trim();
-  const password = qs('#loginPass').value;
-  if (!name || !password) { toast('Enter name and password'); return; }
+  clearAuthErrors();
+  const name = (qs('#loginName').value || '').trim();
+  const password = qs('#loginPass').value || '';
+  if (!name) { showAuthError('loginError', 'Enter your name'); qs('#loginName').focus(); return; }
+  if (!password) { showAuthError('loginError', 'Enter your password'); qs('#loginPass').focus(); return; }
+  const btn = document.getElementById('loginBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Logging in…'; }
+  localStorage.setItem('fh_last_name', name);
   const data = await api('/api/auth/login', {method:'POST', body:JSON.stringify({name, password})});
-  if (data.error) { toast('❌ ' + data.error); return; }
+  if (btn) { btn.disabled = false; btn.textContent = 'Log In'; }
+  if (!data || data.error) {
+    const msg = data?.error === 'User not found' ? 'Name not found — check the spelling'
+              : data?.error === 'Wrong password' ? 'Wrong password — try again'
+              : 'Login failed — try again';
+    showAuthError('loginError', msg);
+    return;
+  }
   session = {token: data.token, user: data.user};
   localStorage.setItem('fh_session', JSON.stringify(session));
   startApp();
 }
 
-// Check invite param on load
-const urlInvite = new URLSearchParams(location.search).get('invite');
+// Pre-fill saved name; check invite URL param
+const _savedName = localStorage.getItem('fh_last_name');
+if (_savedName && document.getElementById('loginName')) {
+  document.getElementById('loginName').value = _savedName;
+}
+const _urlParams = new URLSearchParams(location.search);
+const urlInvite = _urlParams.get('token') || _urlParams.get('invite');
 if (urlInvite) {
   switchAuthTab('invite');
-  qs('#inviteCode').value = urlInvite;
+  document.getElementById('inviteCode').value = urlInvite;
 }
 
 // ─── APP INIT ────────────────────────────────────────────────────────────────
