@@ -1817,12 +1817,12 @@ async function loadFeed() {
       const hr = d.toLocaleString('en',{hour:'numeric',minute:'2-digit'});
       return \`<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)" onclick="showTab('events')">
         <div style="background:var(--primary);color:#fff;border-radius:8px;padding:4px 10px;text-align:center;min-width:40px">
-          <div style="font-size:11px;font-weight:700;text-transform:uppercase">${mo}</div>
-          <div style="font-size:18px;font-weight:800;line-height:1">${dy}</div>
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase">\${mo}</div>
+          <div style="font-size:18px;font-weight:800;line-height:1">\${dy}</div>
         </div>
         <div style="flex:1;min-width:0">
-          <div style="font-weight:700;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(e.title)}</div>
-          <div style="font-size:12px;color:var(--muted)">${hr}\${e.location?' · '+esc(e.location):''}</div>
+          <div style="font-weight:700;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">\${esc(e.title)}</div>
+          <div style="font-size:12px;color:var(--muted)">\${hr}\${e.location?' · '+esc(e.location):''}</div>
         </div>
       </div>\`;
     }).join('');
