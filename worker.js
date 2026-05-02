@@ -1,5 +1,5 @@
 // Family Hub v2 — single-file Cloudflare Worker
-// Built: 2026-05-03 (v14 — visual overhaul)
+// Built: 2026-05-03 (v14.2 — fix createEvent scope collision)
 
 // Family Hub v2 - Part 1: Auth, Crypto, Core API helpers
 
@@ -1335,7 +1335,7 @@ textarea{resize:vertical;min-height:80px}
 
     <!-- MORE (Birthdays, Gifts, KK, Expenses, Transfers, Vault) -->
     <div class="screen" id="screenMore">
-      <div class="header"><h1>⋯ More</h1></div>
+      <div class="header"><h1 style="font-size:18px;font-weight:700">More</h1></div>
       <div class="tabs" id="moreTabs">
         <div class="tab active" onclick="switchMoreTab('birthdays')">🎂 Birthdays</div>
         <div class="tab" onclick="switchMoreTab('gifts')">🎁 Gifts</div>
@@ -1483,7 +1483,7 @@ textarea{resize:vertical;min-height:80px}
       <div class="input-group"><label>When</label><input type="datetime-local" id="eventStart"></div>
       <div class="input-group"><label>Location</label><input type="text" id="eventLocation" placeholder="Address or link..."></div>
       <div class="input-group"><label>Notes</label><textarea id="eventDesc" placeholder="Details..."></textarea></div>
-      <button class="btn btn-primary btn-full" onclick="createEvent()">Add Event</button>
+      <button class="btn btn-primary btn-full" onclick="submitNewEvent()">Add Event</button>
     </div>
   </div>
 
@@ -2337,7 +2337,7 @@ async function loadEvents() {
     </div>\`;
   }).join('');
 }
-async function createEvent() {
+async function submitNewEvent() {
   const title = qs('#eventTitle').value.trim();
   const starts_at = qs('#eventStart').value;
   if (!title || !starts_at) { toast('Title and date required'); return; }
@@ -2728,7 +2728,7 @@ async function loadProfile() {
       <h3 style="margin-bottom:4px;font-size:15px">🏠 \${esc(fam.name)}</h3>
       <p style="color:var(--muted);font-size:13px;margin-bottom:10px">Invite code: <strong style="font-size:16px;letter-spacing:2px">\${fam.invite_code||''}</strong></p>
       \${(families||[]).length > 1 ? \`<div style="margin:8px 0 10px"><p style="color:var(--muted);font-size:12px;margin-bottom:6px">Switch family:</p><div style="display:flex;flex-wrap:wrap;gap:6px">\${(families||[]).map(f=>\`<button onclick="switchFamily('\${f.id}')" style="padding:5px 12px;border-radius:20px;border:1px solid var(--border);background:\${f.id===fam.id?'var(--primary)':'var(--surface)'};color:\${f.id===fam.id?'#fff':'var(--text)'};cursor:pointer;font-size:13px">\${esc(f.name)}</button>\`).join('')}</div></div>\` : ''}
-      <button class="btn btn-ghost btn-sm" onclick="openFamilySettings()">⚙️ Family Settings</button>
+      <button style="padding:10px 18px;border-radius:12px;border:1.5px solid var(--primary);background:rgba(129,140,248,.1);color:var(--primary);font-size:14px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px" onclick="openFamilySettings()">⚙️ Family Settings</button>
     </div>\` : ''}
 
     <div style="background:var(--surface2);border-radius:12px;padding:16px;margin-bottom:14px">
@@ -3098,12 +3098,15 @@ async function renderChoreLeaderboard() {
   const el = document.getElementById('choreLeaderboard');
   if (!el) return;
   const chores = await api('/api/chores') || [];
-  // Tally points by completer (done_today count * points as proxy)
+  // Tally points by assigned person if they have done chores today
   const pts = {};
   for (const ch of chores) {
-    if (ch.last_done_by && ch.done_today > 0) {
-      pts[ch.last_done_by] = (pts[ch.last_done_by]||0) + (ch.points||1) * ch.done_today;
+    const doer = ch.assigned_to;
+    const doneCount = parseInt(ch.done_today||0);
+    if (doer && doneCount > 0) {
+      pts[doer] = (pts[doer]||0) + (ch.points||1) * doneCount;
     }
+    // also count unassigned chores done today toward last completer if available
   }
   const sorted = Object.entries(pts).sort((a,b)=>b[1]-a[1]).slice(0,5);
   if (!sorted.length) { el.innerHTML=''; return; }
@@ -3151,6 +3154,7 @@ async function completeChore(id){await api('/api/chores/'+id+'/complete',{method
 async function deleteChore(id){if(!confirm('Delete this chore?'))return;await api('/api/chores/'+id,{method:'DELETE'});renderChores();}
 
 // ── MEALS ─────────────────────────────────
+let mealWeekOffset = 0;
 const DAYS=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
 async function loadMeals() {
   const c = qs('#moreContent');
