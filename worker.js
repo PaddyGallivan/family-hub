@@ -273,6 +273,20 @@ async function handlePosts(path, request, env, user) {
     }
   }
 
+  // DELETE post (owner only)
+  const deletePostMatch = path.match(/^\/api\/posts\/([^/]+)$/);
+  if (deletePostMatch && method === 'DELETE') {
+    const postId = deletePostMatch[1];
+    const post = await env.DB.prepare('SELECT user_id FROM posts WHERE id=?').bind(postId).first();
+    if (!post) return err('Not found', 404);
+    if (post.user_id !== user.id) return err('Forbidden', 403);
+    await env.DB.prepare('DELETE FROM post_media WHERE post_id=?').bind(postId).run();
+    await env.DB.prepare("DELETE FROM reactions WHERE ref_id=? AND ref_type='post'").bind(postId).run();
+    await env.DB.prepare('DELETE FROM comments WHERE post_id=?').bind(postId).run();
+    await env.DB.prepare('DELETE FROM posts WHERE id=?').bind(postId).run();
+    return json({ok:true});
+  }
+
   return null;
 }
 
@@ -920,7 +934,7 @@ function getSPA() {
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#6366f1">
 <link rel="manifest" href="/manifest.json">
-<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <title>Family Hub 🏠</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
@@ -1002,7 +1016,12 @@ textarea{resize:vertical;min-height:80px}
 .post-media.count-1 img{width:100%;max-height:400px;object-fit:cover}
 .post-media.count-2{grid-template-columns:1fr 1fr}
 .post-media img{width:100%;height:180px;object-fit:cover;cursor:pointer}
-.post-actions{display:flex;gap:0;border-top:1px solid var(--border);padding:4px 8px}
+.post-actions{display:flex;gap:0;border-top:1px solid var(--border);padding:4px 8px;flex-wrap:wrap;position:relative}
+.post-delete-btn{background:none;border:none;cursor:pointer;font-size:16px;color:var(--muted);padding:4px 8px;border-radius:6px;opacity:.5;transition:opacity .15s;margin-left:auto}
+.post-delete-btn:hover{opacity:1;color:#ef4444}
+.react-picker{display:flex;gap:4px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:24px;box-shadow:0 4px 16px rgba(0,0,0,.2);margin:4px 8px;z-index:100;width:calc(100% - 16px)}
+.react-picker span{font-size:22px;cursor:pointer;transition:transform .1s;flex:1;text-align:center}
+.react-picker span:hover{transform:scale(1.3)}
 .post-action{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;padding:8px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--muted);transition:all .15s}
 .post-action:hover{background:var(--surface2);color:var(--text)}
 .post-action.liked{color:#ef4444}
@@ -1334,7 +1353,8 @@ textarea{resize:vertical;min-height:80px}
     <div class="modal">
       <div class="modal-handle"></div>
       <h2>New Post</h2>
-      <textarea id="postContent" placeholder="What's happening in the family?" style="margin-bottom:12px"></textarea>
+      <textarea id="postContent" placeholder="What's happening in the family?" rows="3" style="margin-bottom:4px;resize:none" oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px';qs('#postCharCount').textContent=this.value.length+'/500'" maxlength="500"></textarea>
+      <div id="postCharCount" style="text-align:right;font-size:11px;color:var(--muted);margin-bottom:8px">0/500</div>
       <div style="margin-bottom:12px">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--muted);font-size:14px">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21,15 16,10 5,21"/></svg>
@@ -1652,6 +1672,10 @@ if (session?.token) startApp();
 else qs('#authScreen').style.display = 'flex';
 
 // ─── NAV ────────────────────────────────────────────────────────────────────
+function showTab(name) {
+  const map = {feed:'Feed',chats:'Chats',events:'Events',more:'More',profile:'Profile'};
+  if (map[name]) switchScreen(map[name]);
+}
 function switchScreen(name) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
@@ -1773,9 +1797,42 @@ async function postStory() {
 
 // ─── FEED ────────────────────────────────────────────────────────────────────
 async function loadFeed() {
-  const posts = await api('/api/posts?limit=20');
+  const [posts, events] = await Promise.all([
+    api('/api/posts?limit=20'),
+    api('/api/events')
+  ]);
   const list = qs('#feedList');
-  if (!posts?.length) {
+  // Upcoming events banner (next 3 within 30 days)
+  const now = Date.now();
+  const upcoming = (events||[]).filter(e => {
+    const t = new Date(e.starts_at).getTime();
+    return t >= now && t <= now + 30*24*3600*1000;
+  }).slice(0,3);
+  let evHtml = '';
+  if (upcoming.length) {
+    const eventCards = upcoming.map(e => {
+      const d = new Date(e.starts_at);
+      const mo = d.toLocaleString('en',{month:'short'});
+      const dy = d.getDate();
+      const hr = d.toLocaleString('en',{hour:'numeric',minute:'2-digit'});
+      return \`<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)" onclick="showTab('events')">
+        <div style="background:var(--primary);color:#fff;border-radius:8px;padding:4px 10px;text-align:center;min-width:40px">
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase">${mo}</div>
+          <div style="font-size:18px;font-weight:800;line-height:1">${dy}</div>
+        </div>
+        <div style="flex:1;min-width:0">
+          <div style="font-weight:700;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(e.title)}</div>
+          <div style="font-size:12px;color:var(--muted)">${hr}\${e.location?' · '+esc(e.location):''}</div>
+        </div>
+      </div>\`;
+    }).join('');
+    evHtml = \`<div style="background:var(--surface);border-radius:12px;margin:8px 12px 0;padding:8px 12px">
+      <div style="font-size:12px;font-weight:700;color:var(--primary);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">📅 Upcoming</div>
+      \${eventCards}
+      <div style="text-align:right;margin-top:6px"><button class="btn btn-sm btn-ghost" style="font-size:12px" onclick="showTab('events')">See all →</button></div>
+    </div>\`;
+  }
+  if (!posts?.length && !evHtml) {
     list.innerHTML = \`<div class="empty-state">
       <div class="icon">👋</div>
       <h3 style="margin:0 0 8px;font-size:18px">Welcome to Family Hub!</h3>
@@ -1784,30 +1841,55 @@ async function loadFeed() {
     </div>\`;
     return;
   }
-  list.innerHTML = posts.map(p => renderPost(p)).join('');
+  list.innerHTML = evHtml + (posts||[]).map(p => renderPost(p)).join('');
 }
 function renderPost(p) {
   const mediaHtml = p.media?.length ? \`<div class="post-media count-\${Math.min(p.media.length,4)}">\${p.media.slice(0,4).map(m=>\`<img src="/api/photos/\${encodeURIComponent(m.r2_key)}" onclick="viewImg('\${m.r2_key}')" loading="lazy">\`).join('')}</div>\` : '';
-  const emoji = p.my_reaction || '❤️';
-  return \`<div class="post-card">
+  const isOwn = p.user_id === currentUser?.id;
+  const reactionEmoji = p.my_reaction || '❤️';
+  const deleteBtn = isOwn ? \`<button class="post-delete-btn" onclick="deletePost('\${p.id}')" title="Delete post">🗑</button>\` : '';
+  return \`<div class="post-card" data-post-id="\${p.id}">
     <div class="post-header">
       <div class="avatar" style="background:\${p.avatar_color||'#6366f1'}">\${initials(p.author_name)}</div>
-      <div>
+      <div style="flex:1">
         <div style="font-weight:700;font-size:15px">\${p.author_name}</div>
         <div class="text-xs text-muted">\${timeAgo(p.created_at)}</div>
       </div>
+      \${deleteBtn}
     </div>
     \${p.content ? \`<div class="post-content">\${p.content}</div>\` : ''}
     \${mediaHtml}
     <div class="post-actions">
-      <div class="post-action \${p.my_reaction?'liked':''}" onclick="reactPost('\${p.id}','❤️',this)">
-        <span>❤️</span> <span>\${p.reaction_count||0}</span>
+      <div class="post-action \${p.my_reaction?'liked':''}" onclick="showReactPicker('\${p.id}',this)" style="position:relative">
+        <span>\${reactionEmoji}</span> <span>\${p.reaction_count||0}</span>
       </div>
       <div class="post-action" onclick="loadComments('\${p.id}','\${p.author_name}')">
         <span>💬</span> <span>\${p.comment_count||0}</span>
       </div>
     </div>
   </div>\`;
+}
+function showReactPicker(postId, el) {
+  // If already reacted, clicking again un-reacts
+  const card = el.closest('.post-card');
+  const existing = card.querySelector('.react-picker');
+  if (existing) { existing.remove(); return; }
+  const picker = document.createElement('div');
+  picker.className = 'react-picker';
+  picker.innerHTML = ['❤️','😂','🔥','👍','😮','😢'].map(e =>
+    \`<span onclick="reactPost('\${postId}','\${e}',this.closest('.post-actions').querySelector('.post-action'));this.closest('.react-picker').remove()" title="\${e}">\${e}</span>\`
+  ).join('');
+  el.parentNode.insertBefore(picker, el.nextSibling);
+  setTimeout(() => { document.addEventListener('click', function rm(ev) { if (!picker.contains(ev.target) && ev.target !== el) { picker.remove(); document.removeEventListener('click', rm); } }, {once:false}); }, 10);
+}
+async function deletePost(postId) {
+  if (!confirm('Delete this post?')) return;
+  const r = await api('/api/posts/' + postId, {method:'DELETE'});
+  if (!r.error) {
+    const card = document.querySelector(\`[data-post-id="\${postId}"]\`);
+    if (card) card.remove();
+    toast('Post deleted');
+  }
 }
 async function reactPost(postId, reaction, el) {
   const r = await api('/api/posts/' + postId + '/react', {method:'POST', body:JSON.stringify({reaction})});
@@ -3224,7 +3306,16 @@ export default {
     // Serve SPA
     if (path === '/' || path === '/index.html' || (!path.startsWith('/api/'))) {
       // PWA manifest
-      if (url.pathname === '/manifest.json') {
+      // iOS apple-touch-icon
+  if (url.pathname === '/apple-touch-icon.png' || url.pathname === '/apple-touch-icon-precomposed.png') {
+    const b64 = 'iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAYAAAA9zQYyAAACx0lEQVR42u3bMWpDQRQEwbmrwff3CWwUKDEIlBjWvTXQB/hvKxPaDt/H59e3zmkGLPAAC3CIBTfIAhtkXQHbIykD28MogdpjKAPbAyiD2uGVQe3gyqB2aGVQO7AyqB1WGdQOqgxqh1QKtSMqA9oBlUHtcEqhdjRlQDuYUqgdSxnQDqUUakdSBrQDKYXacQS0dCJoh1EKtaMIaAlo6Y9BO4hSqB1DQEtAS0BLQAtoCWjpKNAOoRRqRxDQEtAS0BLQAloCWgJaAloCWkBLQOuNHnMHoDOYn3MPoDOYoQY6hxlqoHOYoQY6BRlsoLOYoQY6hxlqoHOYoQY6hxlqoFOQwQY6ixlqoHOYoQY6hxlqoHOYoQY6BRlsoLOYoQY6hxlqoHOYoQY6hxlqoFOQwQY6ixlqoHOYob4cdHlAwww10CCDDTTMUAMNM9RAw3wd6sEMNdAggw00zFADDTPU94I2qAezlVAPZCvBHsxWQj2YrYR6MFsJ9WC2EuqBbCXYg9lKqAezlVAPZiuhHsxWQj2QrQR7MFsJ9WC2EurBbCXUg9lKqAeylWD7C5b5CxbQQAMNNNBAAw000AY00EADDTTQQAMNNNBAAw20AQ000EADDTTQQAMNNNBAA21AA33W4wMNNNBAAw000ED7JqA9vm8CGmiggQYaaKCBBhpo3wS0xwcaaKCBBhpooIEGGmigfRPQHh9ooIEGGmiggQYaaKCB9k1Ae3yggQYaaKCBLoN+DGigM5iBBhpooH0T0B7fNwHt8YEGGmiggQYaaKB905GgS6iBvhP0fq/2i6HuCmgBLf0b0FArhRloAS2dDBpqpTADrRxoqJXCDLRyoKFWCjPQyoGGWinMUCuHGWjlQEOtFGaolcMMtXKYoVYOM9TKYYZaOcxQK4cZauUwg60cZKiVxAy2cpDBVhIy2EpChlu7bR4dYOAF7Iv9AKMcfmOIha4cAAAAAElFTkSuQmCC';
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i=0; i<binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Response(bytes, {headers:{'content-type':'image/png','cache-control':'public,max-age=604800'}});
+  }
+
+  if (url.pathname === '/manifest.json') {
         const manifest = {
           name: 'Family Hub',
           short_name: 'Family Hub',
