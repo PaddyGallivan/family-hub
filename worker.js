@@ -86,6 +86,8 @@ function err(msg, status=400) { return json({error:msg}, status); }
 
 async function createNotif(env, userId, type, title, body, refId=null, refType=null) {
   try {
+    const pref = await env.DB.prepare('SELECT enabled FROM notification_prefs WHERE user_id=? AND type=?').bind(userId, type).first();
+    if (pref && pref.enabled === 0) return; // user disabled this type
     await env.DB.prepare(
       'INSERT INTO notifications (user_id,type,title,body,ref_id,ref_type) VALUES (?,?,?,?,?,?)'
     ).bind(userId, type, title, body, refId, refType).run();
@@ -639,6 +641,28 @@ async function handleTransfers(path, request, env, user) {
 }
 
 // ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
+// ─── NOTIFICATION PREFS ──────────────────────────────────────────────────────
+async function handleNotifPrefs(path, request, env, user) {
+  if (path === '/api/notification-prefs') {
+    if (request.method === 'GET') {
+      const rows = await env.DB.prepare('SELECT type, enabled FROM notification_prefs WHERE user_id=?').bind(user.id).all();
+      // Default all types to enabled if no row exists
+      const types = ['post','comment','reaction','event','message','expense','transfer','chore','birthday','kk'];
+      const map = Object.fromEntries(types.map(t => [t, 1]));
+      for (const r of rows.results) map[r.type] = r.enabled;
+      return json(map);
+    }
+    if (request.method === 'PUT') {
+      const prefs = await request.json();
+      for (const [type, enabled] of Object.entries(prefs)) {
+        await env.DB.prepare('INSERT OR REPLACE INTO notification_prefs (user_id,type,enabled) VALUES (?,?,?)').bind(user.id, type, enabled ? 1 : 0).run();
+      }
+      return json({ok:true});
+    }
+  }
+  return null;
+}
+
 async function handleNotifications(path, request, env, user) {
   const method = request.method;
 
@@ -2582,9 +2606,60 @@ async function loadProfile() {
       </div>\`).join('')}
     </div>
 
+    <div style="background:var(--surface2);border-radius:12px;padding:16px;margin-bottom:14px" id="notifPrefsCard">
+      <h3 style="margin-bottom:4px;font-size:15px">⚙️ Notification Settings</h3>
+      <p style="color:var(--muted);font-size:12px;margin-bottom:12px">Choose what you get notified about</p>
+      <div id="notifPrefToggles" style="display:flex;flex-direction:column;gap:10px">
+        <div style="text-align:center;color:var(--muted);font-size:13px">Loading...</div>
+      </div>
+    </div>
+
     <button class="btn btn-ghost btn-full" onclick="logout()" style="color:#ef4444;margin-top:4px">Log Out</button>
   \`;
+  loadNotifPrefs();
 }
+const _notifLabels = {
+  post: {icon:'📸', label:'New posts', desc:'When someone shares a post'},
+  comment: {icon:'💬', label:'Comments', desc:'When someone comments on your post'},
+  reaction: {icon:'❤️', label:'Reactions', desc:'When someone reacts to your post'},
+  event: {icon:'📅', label:'Events', desc:'When a new event is added'},
+  message: {icon:'💬', label:'Messages', desc:'New chat messages'},
+  expense: {icon:'💸', label:'Expenses', desc:'When you\'re added to an expense'},
+  transfer: {icon:'💳', label:'Transfers', desc:'Money requests and confirmations'},
+  chore: {icon:'✅', label:'Chores', desc:'Chore reminders and completions'},
+  birthday: {icon:'🎂', label:'Birthdays', desc:'Birthday reminders'},
+  kk: {icon:'🎅', label:'KK Draw', desc:'Secret Santa assignments'}
+};
+
+async function loadNotifPrefs() {
+  const prefs = await api('/api/notification-prefs');
+  const el = document.getElementById('notifPrefToggles');
+  if (!el || !prefs) return;
+  el.innerHTML = Object.entries(_notifLabels).map(([type, {icon, label, desc}]) => {
+    const on = prefs[type] !== 0;
+    return \`<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)">
+      <div>
+        <div style="font-size:14px;font-weight:600">\${icon} \${label}</div>
+        <div style="font-size:12px;color:var(--muted)">\${desc}</div>
+      </div>
+      <button onclick="toggleNotifPref('\${type}',this)" style="background:\${on?'var(--primary)':'var(--surface)'};border:2px solid \${on?'var(--primary)':'var(--border)'};border-radius:20px;width:48px;height:26px;cursor:pointer;position:relative;transition:all .2s" data-on="\${on}">
+        <span style="position:absolute;top:2px;\${on?'right:2px':'left:2px'};width:18px;height:18px;background:\${on?'#fff':'var(--muted)'};border-radius:50%;transition:all .2s;display:block"></span>
+      </button>
+    </div>\`;
+  }).join('');
+}
+
+async function toggleNotifPref(type, btn) {
+  const on = btn.dataset.on !== 'true';
+  btn.dataset.on = on;
+  btn.style.background = on ? 'var(--primary)' : 'var(--surface)';
+  btn.style.borderColor = on ? 'var(--primary)' : 'var(--border)';
+  const span = btn.querySelector('span');
+  if (span) { span.style.right = on ? '2px' : ''; span.style.left = on ? '' : '2px'; span.style.background = on ? '#fff' : 'var(--muted)'; }
+  await api('/api/notification-prefs', {method:'PUT', body:JSON.stringify({[type]: on ? 1 : 0})});
+  toast(on ? '🔔 ' + (_notifLabels[type]?.label||type) + ' on' : '🔕 ' + (_notifLabels[type]?.label||type) + ' off');
+}
+
 function switchFamily(famId) {
   localStorage.setItem('fh_active_family', famId);
   currentFamily = null;
@@ -3562,6 +3637,11 @@ export default {
     }
 
     // Notifications
+    if (path.startsWith('/api/notification-prefs')) {
+      const r = await handleNotifPrefs(path, request, env, user);
+      if (r) return r;
+    }
+
     if (path.startsWith('/api/notifications')) {
       const r = await handleNotifications(path, request, env, user);
       if (r) return r;
