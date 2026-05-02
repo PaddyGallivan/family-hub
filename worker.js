@@ -457,10 +457,15 @@ async function handleChats(path, request, env, user) {
     return json(decrypted);
   }
 
-  // Users list (for new chat)
+  // Users list (for new chat) — filtered to co-family members
   if (path === '/api/users' && method === 'GET') {
-    const users = await env.DB.prepare('SELECT id,name,role,avatar_color,avatar_url FROM users ORDER BY name').all();
-    return json(users.results);
+    const coFamilyUsers = await env.DB.prepare(
+      `SELECT DISTINCT u.id,u.name,u.role,u.avatar_color,u.avatar_url FROM users u
+       JOIN family_members fm ON fm.user_id=u.id
+       WHERE fm.family_id IN (SELECT family_id FROM family_members WHERE user_id=?)
+       ORDER BY u.name`
+    ).bind(user.id).all();
+    return json(coFamilyUsers.results);
   }
 
   return null;
@@ -1200,6 +1205,7 @@ textarea{resize:vertical;min-height:80px}
         <div class="tab" onclick="switchMoreTab('milestones')">🏆 Milestones</div>
         <div class="tab" onclick="switchMoreTab('recipes')">📖 Recipes</div>
         <div class="tab" onclick="switchMoreTab('kindness')">💛 Kindness</div>
+        <div class="tab" onclick="switchMoreTab('photos')">📸 Photos</div>
       </div>
       <div id="moreContent" style="flex:1;overflow-y:auto;padding:12px 0"></div>
     </div>
@@ -1451,7 +1457,24 @@ function avatarEl(u, size='') {
   if (u.avatar_url) return \`<div class="avatar \${size}"><img src="\${u.avatar_url}" alt="\${u.name}"></div>\`;
   return \`<div class="avatar \${size}" style="background:\${u.avatar_color||'#6366f1'}">\${initials(u.name)}</div>\`;
 }
-function openModal(id) { document.getElementById(id).classList.add('open'); }
+function openModal(id) {
+  document.getElementById(id).classList.add('open');
+  const needsUsers = id === 'newChatModal' || id === 'newExpenseModal' || id === 'newTransferModal';
+  if (!needsUsers) return;
+  const populate = (users) => {
+    const others = (users||[]).filter(u => u.id !== currentUser?.id);
+    const boxes = qs('#userCheckboxes');
+    const expUsers = qs('#expSplitUsers');
+    const transferTo = qs('#transferTo');
+    if (boxes) boxes.innerHTML = others.length
+      ? others.map(u => \`<label style="display:flex;gap:8px;align-items:center;cursor:pointer;padding:6px;background:var(--surface2);border-radius:8px"><input type="checkbox" value="\${u.id}" style="width:auto;flex-shrink:0"> <span style="flex:1">\${esc(u.name)}</span><span style="color:var(--muted);font-size:12px">\${u.role||''}</span></label>\`).join('')
+      : '<p style="color:var(--muted);font-size:13px">No family members yet</p>';
+    if (expUsers) expUsers.innerHTML = others.map(u => \`<label style="display:flex;gap:8px;align-items:center;cursor:pointer;padding:6px;background:var(--surface2);border-radius:8px"><input type="checkbox" value="\${u.id}" style="width:auto"> \${esc(u.name)}</label>\`).join('');
+    if (transferTo) transferTo.innerHTML = others.map(u => \`<option value="\${u.id}">\${esc(u.name)}</option>\`).join('');
+  };
+  if (allUsers.length) { populate(allUsers); }
+  else { api('/api/users').then(u => { allUsers = u||[]; populate(allUsers); }); }
+}
 function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 function handleOverlayClick(e, id) { if (e.target === e.currentTarget) closeModal(id); }
 function qs(sel) { return document.querySelector(sel); }
@@ -1766,16 +1789,9 @@ async function loadChats() {
       <div class="chat-time">\${timeAgo(c.last_msg_at||c.created_at)}</div>
     </div>\`;
   }).join('');
-  // Load users for new chat
-  const boxes = qs('#userCheckboxes');
-  if (allUsers.length) {
-    boxes.innerHTML = allUsers.filter(u=>u.id!==currentUser?.id).map(u =>
-      \`<label style="display:flex;gap:8px;align-items:center;cursor:pointer;padding:6px;background:var(--surface2);border-radius:8px">
-        <input type="checkbox" value="\${u.id}" style="width:auto"> \${u.name} <span style="color:var(--muted);font-size:12px">(\${u.role})</span>
-      </label>\`
-    ).join('');
-  }
-}
+  // Pre-load users so new chat modal is ready
+  if (!allUsers.length) { api('/api/users').then(u => { allUsers = u||[]; }); }
+
 async function createChat() {
   const name = qs('#newChatName').value.trim();
   const selected = Array.from(document.querySelectorAll('#userCheckboxes input:checked')).map(i=>i.value);
@@ -1945,6 +1961,7 @@ function loadMoreTab(tab) {
   if (tab==='milestones') loadMilestones();
   if (tab==='recipes') loadRecipes();
   if (tab==='kindness') loadKindness();
+  if (tab==='photos') loadAlbum();
 }
 
 async function loadBirthdays() {
@@ -2262,7 +2279,9 @@ async function uploadDoc() {
 // ─── PROFILE ────────────────────────────────────────────────────────────────────
 async function loadProfile() {
   const [notifs, families] = await Promise.all([api('/api/notifications'), api('/api/families')]);
-  const fam = (families||[])[0];
+  const activeFamId = localStorage.getItem('fh_active_family');
+  const fam = (families||[]).find(f=>f.id===activeFamId) || (families||[])[0];
+  if (fam && !activeFamId) localStorage.setItem('fh_active_family', fam.id);
   const c = qs('#profileContent');
   const avatarHtml = currentUser?.avatar_url
     ? \`<img src="\${currentUser.avatar_url}" style="width:80px;height:80px;border-radius:50%;object-fit:cover">\`
@@ -2297,6 +2316,7 @@ async function loadProfile() {
     \${fam ? \`<div style="background:var(--surface2);border-radius:12px;padding:16px;margin-bottom:14px">
       <h3 style="margin-bottom:4px;font-size:15px">🏠 \${esc(fam.name)}</h3>
       <p style="color:var(--muted);font-size:13px;margin-bottom:10px">Invite code: <strong style="font-size:16px;letter-spacing:2px">\${fam.invite_code||''}</strong></p>
+      \${(families||[]).length > 1 ? \`<div style="margin:8px 0 10px"><p style="color:var(--muted);font-size:12px;margin-bottom:6px">Switch family:</p><div style="display:flex;flex-wrap:wrap;gap:6px">\${(families||[]).map(f=>\`<button onclick="switchFamily('\${f.id}')" style="padding:5px 12px;border-radius:20px;border:1px solid var(--border);background:\${f.id===fam.id?'var(--primary)':'var(--surface)'};color:\${f.id===fam.id?'#fff':'var(--text)'};cursor:pointer;font-size:13px">\${esc(f.name)}</button>\`).join('')}</div></div>\` : ''}
       <button class="btn btn-ghost btn-sm" onclick="openFamilySettings()">⚙️ Family Settings</button>
     </div>\` : ''}
 
@@ -2314,6 +2334,13 @@ async function loadProfile() {
 
     <button class="btn btn-ghost btn-full" onclick="logout()" style="color:#ef4444;margin-top:4px">Log Out</button>
   \`;
+}
+function switchFamily(famId) {
+  localStorage.setItem('fh_active_family', famId);
+  currentFamily = null;
+  allUsers = [];
+  toast('Switched family ✅');
+  loadProfile();
 }
 async function saveProfile() {
   const name = qs('#editName')?.value.trim();
@@ -2363,9 +2390,15 @@ let currentFamily = null;
 async function ensureFamily() {
   if (currentFamily) return currentFamily;
   const r = await api('/api/families');
-  if (r && r.length > 0) { currentFamily = r[0]; return currentFamily; }
+  if (r && r.length > 0) {
+    const activeFamId = localStorage.getItem('fh_active_family');
+    currentFamily = r.find(f=>f.id===activeFamId) || r[0];
+    localStorage.setItem('fh_active_family', currentFamily.id);
+    return currentFamily;
+  }
   const f = await api('/api/families', {method:'POST', body:JSON.stringify({name:(currentUser?.name||'My')+' Family'})});
   currentFamily = f;
+  if (f) localStorage.setItem('fh_active_family', f.id);
   return currentFamily;
 }
 async function openFamilySettings() {
@@ -2410,7 +2443,7 @@ async function toggleFeature(feature, enabled) {
 }
 function applyFeatureToggle(feature, enabled) {
   const navMap = {'Feed':'navFeed','Chats':'navChats','Events':'navEvents'};
-  const moreTabMap = {'Birthdays':'birthdays','Gifts':'gifts','KK Draw':'kk','Expenses':'expenses','Transfers':'transfers','Vault':'vault','Shopping':'shopping','Chores':'chores','Meals':'meals','Milestones':'milestones','Recipes':'recipes','Kindness':'kindness'};
+  const moreTabMap = {'Birthdays':'birthdays','Gifts':'gifts','KK Draw':'kk','Expenses':'expenses','Transfers':'transfers','Vault':'vault','Shopping':'shopping','Chores':'chores','Meals':'meals','Milestones':'milestones','Recipes':'recipes','Kindness':'kindness','Photos':'photos'};
   if (navMap[feature]) { const el=document.getElementById(navMap[feature]); if(el)el.style.display=enabled?'':'none'; }
   if (moreTabMap[feature]) {
     const tabBtn = document.querySelector(\`#moreTabs .tab[onclick*="\${moreTabMap[feature]}"]\`);
@@ -2535,6 +2568,7 @@ async function renderChores() {
       </div>
       <span style="background:#fbbf24;color:#000;font-size:11px;padding:2px 7px;border-radius:99px;font-weight:700">⭐\${ch.points||1}</span>
       <button onclick="completeChore('\${ch.id}')" style="background:var(--success);color:#fff;border:none;border-radius:8px;padding:7px 12px;font-size:12px;cursor:pointer">✓ Done</button>
+      <button onclick="deleteChore('\${ch.id}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px;padding:0 4px" title="Delete">🗑</button>
     </div>\`;
   }).join('');
 }
@@ -2547,6 +2581,7 @@ async function addChore(){
   renderChores();
 }
 async function completeChore(id){await api('/api/chores/'+id+'/complete',{method:'POST'});renderChores();}
+async function deleteChore(id){if(!confirm('Delete this chore?'))return;await api('/api/chores/'+id,{method:'DELETE'});renderChores();}
 
 // ── MEALS ─────────────────────────────────
 const DAYS=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
@@ -2699,6 +2734,101 @@ async function loadKindness() {
   renderKindness();
 }
 function toggleKindnessForm(){const f=document.getElementById('kindnessAddForm');if(f)f.style.display=f.style.display==='none'?'block':'none';}
+
+// ── PHOTO ALBUM ────────────────────────────────────────────────
+let viewingAlbumPhoto = null;
+async function loadAlbum() {
+  const c = qs('#moreContent');
+  c.innerHTML = \`<div style="padding:16px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <h3 style="font-size:16px;font-weight:700">📸 Family Photos</h3>
+      <label style="background:var(--primary);color:#fff;padding:7px 14px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600">
+        + Upload <input type="file" accept="image/*" style="display:none" onchange="uploadAlbumPhoto(this)">
+      </label>
+    </div>
+    <div id="albumGrid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:3px"></div>
+    <div id="albumViewer" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:200;flex-direction:column;align-items:center;justify-content:center" onclick="closeAlbumViewer(event)">
+      <button onclick="closeAlbumViewer()" style="position:absolute;top:16px;right:16px;background:none;border:none;color:#fff;font-size:28px;cursor:pointer;line-height:1">&#x2715;</button>
+      <img id="albumViewerImg" style="max-width:95vw;max-height:62vh;border-radius:8px;object-fit:contain">
+      <div style="background:#111;border-radius:12px;padding:14px;margin-top:12px;max-width:360px;width:90%">
+        <div id="albumViewerCaption" style="color:#fff;font-size:14px;margin-bottom:4px"></div>
+        <div id="albumViewerMeta" style="color:#888;font-size:12px;margin-bottom:10px"></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button onclick="reactAlbum('❤️')" style="background:#222;border:none;color:#fff;padding:6px 12px;border-radius:20px;cursor:pointer;font-size:15px">❤️ <span id="albumReact_heart">0</span></button>
+          <button onclick="reactAlbum('😂')" style="background:#222;border:none;color:#fff;padding:6px 12px;border-radius:20px;cursor:pointer;font-size:15px">😂 <span id="albumReact_laugh">0</span></button>
+          <button onclick="reactAlbum('🔥')" style="background:#222;border:none;color:#fff;padding:6px 12px;border-radius:20px;cursor:pointer;font-size:15px">🔥 <span id="albumReact_fire">0</span></button>
+          <div style="flex:1"></div>
+          <button id="albumDeleteBtn" style="display:none;background:#ef4444;border:none;color:#fff;padding:6px 12px;border-radius:8px;cursor:pointer;font-size:12px" onclick="deleteAlbumPhoto()">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>\`;
+  renderAlbumGrid();
+}
+async function renderAlbumGrid() {
+  const photos = await api('/api/album');
+  const grid = document.getElementById('albumGrid');
+  if (!grid) return;
+  if (!photos||!photos.length) {
+    grid.innerHTML='<div style="grid-column:1/-1;text-align:center;color:var(--muted);padding:40px 20px">No photos yet 📸<br><span style="font-size:13px">Tap + Upload to share one!</span></div>';
+    return;
+  }
+  grid.innerHTML = photos.map(p=>\`<div onclick="openAlbumPhoto(\${JSON.stringify(p).replace(/"/g,'&quot;')})" style="aspect-ratio:1;overflow:hidden;cursor:pointer;background:var(--surface2)">
+    <img src="/api/photos/\${encodeURIComponent(p.r2_key)}" style="width:100%;height:100%;object-fit:cover" loading="lazy">
+  </div>\`).join('');
+}
+async function uploadAlbumPhoto(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const caption = prompt('Caption (optional):') || '';
+  toast('Uploading... 📸');
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('folder', 'album');
+  const up = await fetch('/api/photos/upload', {method:'POST', headers:{'X-Session-Token':session?.token||''}, body:fd});
+  const upData = await up.json();
+  if (!upData.key) { toast('Upload failed ❌'); return; }
+  await api('/api/album', {method:'POST', body:JSON.stringify({r2_key:upData.key, caption:caption||null})});
+  toast('Photo shared! 📸');
+  renderAlbumGrid();
+}
+function openAlbumPhoto(p) {
+  viewingAlbumPhoto = p;
+  const v = document.getElementById('albumViewer');
+  if (!v) return;
+  v.style.display = 'flex';
+  document.getElementById('albumViewerImg').src = '/api/photos/' + encodeURIComponent(p.r2_key);
+  document.getElementById('albumViewerCaption').textContent = p.caption || '';
+  document.getElementById('albumViewerMeta').textContent = (p.uploader_name||'Someone') + ' · ' + timeAgo(p.created_at);
+  document.getElementById('albumDeleteBtn').style.display = p.user_id === currentUser?.id ? 'block' : 'none';
+  const counts = p.reaction_counts || {};
+  document.getElementById('albumReact_heart').textContent = counts['❤️']||0;
+  document.getElementById('albumReact_laugh').textContent = counts['😂']||0;
+  document.getElementById('albumReact_fire').textContent = counts['🔥']||0;
+}
+function closeAlbumViewer(e) {
+  if (e && e.target.id !== 'albumViewer') return;
+  const v = document.getElementById('albumViewer');
+  if (v) v.style.display = 'none';
+  viewingAlbumPhoto = null;
+}
+async function reactAlbum(emoji) {
+  if (!viewingAlbumPhoto) return;
+  await api('/api/album/'+viewingAlbumPhoto.id+'/react', {method:'POST', body:JSON.stringify({reaction:emoji})});
+  const photos = await api('/api/album');
+  const updated = (photos||[]).find(p=>p.id===viewingAlbumPhoto.id);
+  if (updated) openAlbumPhoto(updated);
+  renderAlbumGrid();
+}
+async function deleteAlbumPhoto() {
+  if (!viewingAlbumPhoto || !confirm('Delete this photo?')) return;
+  await api('/api/album/'+viewingAlbumPhoto.id, {method:'DELETE'});
+  const v = document.getElementById('albumViewer');
+  if (v) v.style.display = 'none';
+  viewingAlbumPhoto = null;
+  renderAlbumGrid();
+}
+
 async function renderKindness(){
   const acts=await api('/api/kindness');
   const el=document.getElementById('kindnessList');
@@ -2895,6 +3025,62 @@ const _pollOnLogin = setInterval(() => {
 
 
 // ─── MAIN ROUTER ──────────────────────────────────────────────────────────────
+// ─── ALBUM ────────────────────────────────────────────────────────────────────
+async function handleAlbum(path, request, env, user) {
+  const method = request.method;
+
+  if (path === '/api/album' && method === 'GET') {
+    const rows = await env.DB.prepare(
+      `SELECT ap.*, u.name as uploader_name,
+       (SELECT json_group_object(reaction, cnt) FROM
+         (SELECT reaction, COUNT(*) as cnt FROM album_reactions WHERE photo_id=ap.id GROUP BY reaction)
+       ) as reaction_counts_json
+       FROM album_photos ap JOIN users u ON u.id=ap.user_id
+       ORDER BY ap.created_at DESC LIMIT 200`
+    ).all();
+    return json((rows.results||[]).map(r => ({
+      ...r, reaction_counts: r.reaction_counts_json ? JSON.parse(r.reaction_counts_json) : {}
+    })));
+  }
+
+  if (path === '/api/album' && method === 'POST') {
+    const {r2_key, caption} = await request.json();
+    if (!r2_key) return err('No photo key');
+    const id = crypto.randomUUID();
+    await env.DB.prepare('INSERT INTO album_photos (id,user_id,caption,r2_key) VALUES (?,?,?,?)')
+      .bind(id, user.id, caption||null, r2_key).run();
+    return json({id, ok:true}, 201);
+  }
+
+  const photoDelMatch = path.match(/^\/api\/album\/([^/]+)$/);
+  if (photoDelMatch && method === 'DELETE') {
+    await env.DB.prepare('DELETE FROM album_photos WHERE id=? AND user_id=?')
+      .bind(photoDelMatch[1], user.id).run();
+    await env.DB.prepare('DELETE FROM album_reactions WHERE photo_id=?')
+      .bind(photoDelMatch[1]).run();
+    return json({ok:true});
+  }
+
+  const albumReactMatch = path.match(/^\/api\/album\/([^/]+)\/react$/);
+  if (albumReactMatch && method === 'POST') {
+    const {reaction} = await request.json();
+    const photoId = albumReactMatch[1];
+    const existing = await env.DB.prepare('SELECT reaction FROM album_reactions WHERE photo_id=? AND user_id=?')
+      .bind(photoId, user.id).first();
+    if (existing) {
+      if (existing.reaction === reaction)
+        await env.DB.prepare('DELETE FROM album_reactions WHERE photo_id=? AND user_id=?').bind(photoId, user.id).run();
+      else
+        await env.DB.prepare('UPDATE album_reactions SET reaction=? WHERE photo_id=? AND user_id=?').bind(reaction, photoId, user.id).run();
+    } else {
+      await env.DB.prepare('INSERT INTO album_reactions (photo_id,user_id,reaction) VALUES (?,?,?)').bind(photoId, user.id, reaction).run();
+    }
+    return json({ok:true});
+  }
+
+  return null;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -2917,6 +3103,8 @@ export default {
     `CREATE TABLE IF NOT EXISTS recipes (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, ingredients TEXT, steps TEXT, image_key TEXT, created_by TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`,
     `CREATE TABLE IF NOT EXISTS kindness (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, done INTEGER DEFAULT 0, done_by TEXT, created_by TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`,
     `CREATE TABLE IF NOT EXISTS emergency_contacts (id TEXT PRIMARY KEY, user_id TEXT UNIQUE NOT NULL, name TEXT, relationship TEXT, phone TEXT, blood_type TEXT, allergies TEXT, medications TEXT, notes TEXT)`,
+    `CREATE TABLE IF NOT EXISTS album_photos (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, caption TEXT, r2_key TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`,
+    `CREATE TABLE IF NOT EXISTS album_reactions (photo_id TEXT NOT NULL, user_id TEXT NOT NULL, reaction TEXT NOT NULL, PRIMARY KEY (photo_id,user_id))`,
     `CREATE TABLE IF NOT EXISTS meal_rota (id TEXT PRIMARY KEY, week_date TEXT NOT NULL, day_of_week INTEGER NOT NULL, meal TEXT NOT NULL, cook_id TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE(week_date, day_of_week))`,
     `ALTER TABLE invites ADD COLUMN user_id TEXT`,
     `CREATE TABLE IF NOT EXISTS story_views (story_id TEXT NOT NULL, user_id TEXT NOT NULL, viewed_at DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (story_id, user_id))`,
@@ -3176,6 +3364,11 @@ export default {
       await env.DB.prepare('DELETE FROM chores WHERE id=?').bind(choreMatch[1]).run();
       return json({ok:true});
     }
+    const choreDelMatch = path.match(/^\/api\/chores\/([^/]+)$/);
+    if (choreDelMatch && method === 'DELETE') {
+      await env.DB.prepare('DELETE FROM chores WHERE id=?').bind(choreDelMatch[1]).run();
+      return json({ok:true});
+    }
     const choreCompleteMatch = path.match(/^\/api\/chores\/([^/]+)\/complete$/);
     if (choreCompleteMatch && method === 'POST') {
       await env.DB.prepare('INSERT INTO chore_completions (id,chore_id,user_id) VALUES (?,?,?)').bind(crypto.randomUUID(),choreCompleteMatch[1],user.id).run();
@@ -3267,6 +3460,12 @@ export default {
     }
 
     // ── EMERGENCY CONTACTS ────────────────────────────────────────────────────
+    // Photo Album
+    if (path.startsWith('/api/album')) {
+      const r = await handleAlbum(path, request, env, user);
+      if (r) return r;
+    }
+
     if (path === '/api/emergency' && method === 'GET') {
       const r = await env.DB.prepare('SELECT * FROM emergency_contacts WHERE user_id=?').bind(user.id).first();
       return json(r||null);
