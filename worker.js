@@ -1572,6 +1572,7 @@ function timeAgo(ts) {
   return Math.floor(diff/86400000) + 'd ago';
 }
 function initials(name) { return (name||'?').split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2); }
+function esc(s) { return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function avatarEl(u, size='') {
   if (u.avatar_url) return \`<div class="avatar \${size}"><img src="\${u.avatar_url}" alt="\${u.name}"></div>\`;
   return \`<div class="avatar \${size}" style="background:\${u.avatar_color||'#6366f1'}">\${initials(u.name)}</div>\`;
@@ -1902,7 +1903,7 @@ async function loadFeed(append=false) {
   }
   if (append) {
     list.insertAdjacentHTML('beforeend', (posts||[]).map(p => renderPost(p)).join(''));
-    if (_feedDone) list.insertAdjacentHTML('beforeend', '<div style="text-align:center;padding:24px;color:var(--muted);font-size:13px">You\'re all caught up ✓</div>');
+    if (_feedDone) list.insertAdjacentHTML('beforeend', '<div style="text-align:center;padding:24px;color:var(--muted);font-size:13px">All caught up ✓</div>');
   } else {
     list.innerHTML = evHtml + (posts||[]).map(p => renderPost(p)).join('');
     list.onscroll = () => { if (list.scrollHeight - list.scrollTop - list.clientHeight < 250) loadFeed(true); };
@@ -2060,6 +2061,7 @@ async function loadChats() {
   if (_cb) { _cb.textContent = _unreadCount > 9 ? '9+' : _unreadCount; _cb.style.display = _unreadCount > 0 ? 'flex' : 'none'; }
   // Pre-load users so new chat modal is ready
   if (!allUsers.length) { api('/api/users').then(u => { allUsers = u||[]; }); }
+}
 
 async function createChat() {
   const name = qs('#newChatName').value.trim();
@@ -2624,7 +2626,7 @@ const _notifLabels = {
   reaction: {icon:'❤️', label:'Reactions', desc:'When someone reacts to your post'},
   event: {icon:'📅', label:'Events', desc:'When a new event is added'},
   message: {icon:'💬', label:'Messages', desc:'New chat messages'},
-  expense: {icon:'💸', label:'Expenses', desc:'When you\'re added to an expense'},
+  expense: {icon:'💸', label:'Expenses', desc:'When added to an expense'},
   transfer: {icon:'💳', label:'Transfers', desc:'Money requests and confirmations'},
   chore: {icon:'✅', label:'Chores', desc:'Chore reminders and completions'},
   birthday: {icon:'🎂', label:'Birthdays', desc:'Birthday reminders'},
