@@ -3243,43 +3243,105 @@ function startPolling() {
     }
   }, 5000);
 
-  // Feed: every 15s when feed screen visible
+  // Feed: every 15s when feed screen active
   _pollIntervals.feed = setInterval(async () => {
-    const screen = document.getElementById('feedScreen');
-    if (!screen || screen.classList.contains('hidden')) return;
+    const screen = document.getElementById('screenFeed');
+    if (!screen || !screen.classList.contains('active')) return;
     const posts = await api('/api/posts?limit=20');
     if (!posts || !Array.isArray(posts) || !posts.length) return;
     const newTs = posts[0]?.created_at;
     if (newTs && newTs !== _lastFeedTs) {
+      if (_lastFeedTs) toast('\u2728 New post from the family!');
       _lastFeedTs = newTs;
       _feedOffset=0; _feedDone=false;
       loadFeed();
     }
   }, 15000);
 
-  // Notifications: every 30s always
+  // Notifications: every 20s always
+  let _lastNotifCount = 0;
   _pollIntervals.notif = setInterval(async () => {
     if (!currentUser) return;
     const n = await api('/api/notifications');
     if (!n) return;
     const unread = (n.items||[]).filter(x=>!x.read).length;
     const badge = document.getElementById('notifBadge');
-    if (badge) badge.textContent = unread > 0 ? unread : '';
-    if (badge) badge.style.display = unread > 0 ? 'flex' : 'none';
+    if (badge) { badge.textContent = unread > 0 ? unread : ''; badge.style.display = unread > 0 ? 'flex' : 'none'; }
+    if (unread > _lastNotifCount && _lastNotifCount >= 0) {
+      const newest = n.items?.find(x=>!x.read);
+      if (newest) toast('\U0001F514 ' + newest.title);
+    }
+    _lastNotifCount = unread;
+  }, 20000);
+
+  // Events: every 30s when events screen active
+  _pollIntervals.events = setInterval(async () => {
+    const screen = document.getElementById('screenEvents');
+    if (!screen || !screen.classList.contains('active')) return;
+    const evs = await api('/api/events');
+    if (!evs) return;
+    const el = document.getElementById('eventsList');
+    const newSig = evs.map(e=>e.id+e.going_count).join(',');
+    if (el && el.dataset.sig !== newSig) { el.dataset.sig = newSig; loadEvents(); }
   }, 30000);
 
-  // Stories: every 60s when stories visible
+  // Chat list: every 20s — update badge always, full list only when on chats screen
+  _pollIntervals.chatList = setInterval(async () => {
+    if (!currentUser) return;
+    const chats = await api('/api/chats');
+    if (!chats) return;
+    // Always update badge
+    const _seen = JSON.parse(localStorage.getItem('fh_chat_seen')||'{}');
+    const unread = chats.filter(c => c.last_msg_at && c.last_sender && c.last_sender !== currentUser?.name && (!_seen[c.id] || c.last_msg_at > _seen[c.id])).length;
+    const _cb = document.getElementById('chatBadge');
+    if (_cb) { _cb.textContent = unread > 9 ? '9+' : unread; _cb.style.display = unread > 0 ? 'flex' : 'none'; }
+    // Re-render list if on chats screen
+    const screen = document.getElementById('screenChats');
+    if (screen && screen.classList.contains('active')) loadChats();
+  }, 20000);
+
+  // More tab: every 30s when visible
+  _pollIntervals.more = setInterval(async () => {
+    const screen = document.getElementById('screenMore');
+    if (!screen || !screen.classList.contains('active')) return;
+    const tab = currentMoreTab;
+    if (tab === 'shopping') renderShoppingItems();
+    else if (tab === 'chores') renderChores();
+    else if (tab === 'expenses') loadExpenses();
+    else if (tab === 'photos') loadAlbum();
+  }, 30000);
+
+  // Stories: every 30s when feed active
   _pollIntervals.stories = setInterval(async () => {
-    const bar = document.getElementById('storyStrip');
-    if (!bar) return;
+    const screen = document.getElementById('screenFeed');
+    if (!screen || !screen.classList.contains('active')) return;
     loadStories();
-  }, 60000);
+  }, 30000);
 }
 
 function stopPolling() {
   Object.values(_pollIntervals).forEach(id => clearInterval(id));
   _pollIntervals = {};
 }
+
+// Refresh on visibility change (user returns to tab/app)
+let _lastHidden = 0;
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    _lastHidden = Date.now();
+  } else if (document.visibilityState === 'visible' && currentUser) {
+    const away = Date.now() - _lastHidden;
+    if (away > 30000) { // away > 30s → refresh active screen
+      const active = document.querySelector('.screen.active');
+      if (!active) return;
+      const id = active.id;
+      if (id === 'screenFeed') { _feedOffset=0; _feedDone=false; loadFeed(); loadStories(); }
+      else if (id === 'screenChats') loadChats();
+      else if (id === 'screenEvents') loadEvents();
+      else if (id === 'screenMore') loadMoreTab(currentMoreTab);
+    }
+  }
+});
 
 // Hook: start polling after login
 const _origInit = typeof initApp === 'function' ? initApp : null;
