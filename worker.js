@@ -126,6 +126,13 @@ async function handleAuth(path, request, env) {
     const sessionToken = crypto.randomUUID();
     await env.DB.prepare('INSERT INTO sessions (token,user_id,expires_at) VALUES (?,?,datetime("now","+"||?||" days"))').bind(sessionToken, userId, 30).run();
     const finalUser = await env.DB.prepare('SELECT * FROM users WHERE id=?').bind(userId).first();
+    // Auto-join any family the seeded user belongs to
+    try {
+      const families = await env.DB.prepare('SELECT family_id FROM family_members WHERE user_id=?').bind(invite.user_id||userId).all();
+      for (const fm of families.results||[]) {
+        await env.DB.prepare("INSERT OR IGNORE INTO family_members (family_id,user_id,role) VALUES (?,?,'member')").bind(fm.family_id, userId).run();
+      }
+    } catch {}
     return json({token: sessionToken, user: {id:userId, name:finalUser?.name||name, role:invite.role}});
   }
 
@@ -1645,7 +1652,12 @@ async function loadFeed() {
   const posts = await api('/api/posts?limit=20');
   const list = qs('#feedList');
   if (!posts?.length) {
-    list.innerHTML = '<div class="empty-state"><div class="icon">🏠</div><p>No posts yet. Say hi to the family!</p></div>';
+    list.innerHTML = \`<div class="empty-state">
+      <div class="icon">👋</div>
+      <h3 style="margin:0 0 8px;font-size:18px">Welcome to Family Hub!</h3>
+      <p style="margin:0 0 16px;color:var(--muted);font-size:14px">Share a moment with your family to get started.</p>
+      <button class="btn btn-primary" onclick="openModal('newPostModal')" style="width:auto;padding:10px 24px">📸 Post something</button>
+    </div>\`;
     return;
   }
   list.innerHTML = posts.map(p => renderPost(p)).join('');
@@ -3011,7 +3023,7 @@ export default {
     if (famMembersMatch && method === 'GET') {
       const fid = famMembersMatch[1];
       const rows = await env.DB.prepare(
-        'SELECT u.id,u.name,u.avatar_color,u.avatar_url,fm.role FROM users u JOIN family_members fm ON fm.user_id=u.id WHERE fm.family_id=? ORDER BY fm.role DESC,u.name'
+        'SELECT u.id,u.name,u.avatar_color,u.avatar_url,fm.role,(CASE WHEN u.password_hash IS NOT NULL THEN 1 ELSE 0 END) as registered FROM users u JOIN family_members fm ON fm.user_id=u.id WHERE fm.family_id=? ORDER BY registered DESC,u.name'
       ).bind(fid).all();
       return json(rows.results);
     }
@@ -3023,7 +3035,7 @@ export default {
       rows.results.forEach(r => out[r.feature] = r.enabled);
       return json(out);
     }
-    if (famSettingsMatch && method === 'PATCH') {
+    if (famSettingsMatch && (method === 'PATCH' || method === 'POST')) {
       const fid = famSettingsMatch[1];
       const {feature, enabled} = await request.json();
       await env.DB.prepare('INSERT OR REPLACE INTO family_settings (family_id,feature,enabled) VALUES (?,?,?)').bind(fid,feature,enabled?1:0).run();
